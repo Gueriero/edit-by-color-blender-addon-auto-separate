@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "edit_by_color_by_kiri_engine"
+version = "2.0.0"
+name = "Edit By Color by KIRI Engine"
+tagline = "Select and edit meshes by colour"
+maintainer = "Blue Nile 3D"
+type = "add-on"
+tags = ["Mesh"]
+blender_version_min = "4.2.0"
+license = [
+"SPDX:GPL-2.0-or-later",
+]
