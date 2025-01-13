@@ -4,10 +4,15 @@
 
 ## Introduction:
 The Colour Selection panel provides intuitive controls to precisely select mesh elements based on their texture colors, with adjustable tolerance and selection refinement options.
+
 Live Effects, powered by Geometry Nodes, enables real-time deletion, smoothing, and material assignment while dynamically adjusting your color selection.
+
 The Edit Mesh panel hosts essential editing operations that let you duplicate selected areas to new objects, split them from the current mesh, or simply convert them into Edit Mode selections.
+
 For Sculpt mode, convert your colour selections into Face Sets for targeted sculpting and smoothing operations, making high-density scan editing more manageable, especially for beginners.
+
 The Texture baking system allows you to create, replace, and rebake selected areas of your model's texture, perfect for removing unwanted details or surface imperfections.
+
 Retopo Loops automatically generate clean quad topology around colour-selected areas to jump start your retopology workflow on scanned models.
 
 ## Installation:
