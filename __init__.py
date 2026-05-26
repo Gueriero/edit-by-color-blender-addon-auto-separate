@@ -2895,15 +2895,27 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
     do_separate: bpy.props.BoolProperty(
         name='Separate by Material', default=True,
     )
+    remove_modifier: bpy.props.BoolProperty(
+        name='Remove EBC Modifier after Split', default=True,
+        description='Removes the KIRI_Edit_By_Colour_GN modifier from the result objects so their EBC_Auto materials show correctly',
+    )
 
     def execute(self, context):
-        import math, colorsys, random
+        import math, colorsys, random, time
         try:
             import numpy as np
         except Exception:
             self.report({'ERROR'}, 'numpy not available in this Blender build')
             return {'CANCELLED'}
 
+        def log(msg):
+            print(f'[AutoPalette] {msg}', flush=True)
+
+        t_start = time.time()
+        def t_since():
+            return f'{time.time() - t_start:.1f}s'
+
+        log(f'=== Auto Palette Split started: K={self.num_clusters}, samples={self.samples_per_face}, HSV={self.use_hsv} ===')
         obj = context.view_layer.objects.active
         if obj is None or obj.type != 'MESH':
             self.report({'ERROR'}, 'No active mesh')
@@ -2939,9 +2951,11 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             return {'CANCELLED'}
 
         # Read image pixels into numpy once
+        log(f'Reading image pixels: {w}x{h} ({w*h/1e6:.2f}M px)...')
         npx = np.empty(len(image.pixels), dtype=np.float32)
         image.pixels.foreach_get(npx)
         img = npx.reshape(h, w, 4)[:, :, :3]
+        log(f'Image read in {t_since()}')
 
         # Barycentric sample points
         n = max(1, self.samples_per_face)
@@ -2969,9 +2983,17 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
 
         # Per-face average color
         face_colors = np.zeros((n_polys, 3), dtype=np.float32)
+        log(f'Sampling {n_polys} polygons (this is the slow part)...')
+        t_sample = time.time()
+        progress_step = max(1, n_polys // 20)
 
         # Process polys — for tri/quad fast path, fallback fan
         for pi, poly in enumerate(me.polygons):
+            if pi and pi % progress_step == 0:
+                pct = pi * 100 // n_polys
+                elapsed = time.time() - t_sample
+                eta = elapsed * (n_polys - pi) / pi
+                log(f'  sampling {pct}% ({pi}/{n_polys}) elapsed {elapsed:.1f}s ETA {eta:.1f}s')
             li = poly.loop_indices
             ln = poly.loop_total
             if ln < 3:
@@ -3013,6 +3035,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             h_ = (h_ / 6.0) % 1.0
             return np.stack([h_, s, mx], axis=1)
 
+        log(f'Sampling done in {time.time() - t_sample:.1f}s. Preparing cluster space...')
         if self.use_hsv:
             cluster_data = rgb_to_hsv_np(face_colors)
             # Weight: hue cyclic distance handled via cos/sin to keep euclidean kmeans valid
@@ -3032,6 +3055,8 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             sample = cluster_data
 
         K = self.num_clusters
+        log(f'K-means++ init for K={K} on {sample.shape[0]} samples...')
+        t_km = time.time()
         # k-means++ init
         rng = np.random.default_rng(42)
         first = rng.integers(0, sample.shape[0])
@@ -3061,17 +3086,26 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
                     new_centers[c] = centers[c]
             shift = np.linalg.norm(new_centers - centers)
             centers = new_centers
+            log(f'  iter {it+1}/{self.kmeans_iters}: shift={shift:.5f}')
             if shift < 1e-5:
+                log(f'  converged early at iter {it+1}')
                 break
+        log(f'K-means done in {time.time() - t_km:.1f}s')
 
         # Assign all faces to nearest center (chunked to avoid OOM on big meshes)
+        log(f'Assigning {cluster_data.shape[0]} faces to nearest cluster (chunked)...')
+        t_assign = time.time()
         face_labels = np.empty(cluster_data.shape[0], dtype=np.int32)
         chunk = 50000
-        for start in range(0, cluster_data.shape[0], chunk):
+        total_chunks = (cluster_data.shape[0] + chunk - 1) // chunk
+        for ci, start in enumerate(range(0, cluster_data.shape[0], chunk)):
             end = min(start + chunk, cluster_data.shape[0])
             seg = cluster_data[start:end]
             d2_seg = np.sum((seg[:, None, :] - centers[None, :, :]) ** 2, axis=2)
             face_labels[start:end] = np.argmin(d2_seg, axis=1)
+            if ci % 5 == 0 or ci == total_chunks - 1:
+                log(f'  chunk {ci+1}/{total_chunks}')
+        log(f'Assignment done in {time.time() - t_assign:.1f}s')
 
         # Compute representative RGB color per cluster from face_colors
         cluster_rgb = np.zeros((K, 3), dtype=np.float32)
@@ -3081,6 +3115,8 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
                 cluster_rgb[c] = face_colors[mask].mean(axis=0)
 
         # Create materials and assign
+        log('Creating materials...')
+        t_mat = time.time()
         slot_map = {}
         for c in range(K):
             if not (face_labels == c).any():
@@ -3106,14 +3142,27 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
                 slot_idx = len(obj.material_slots) - 1
             slot_map[c] = slot_idx
 
+        log(f'Materials done in {time.time() - t_mat:.1f}s ({len(slot_map)} non-empty buckets)')
+        log('Writing material_index per polygon...')
+        t_w = time.time()
         for pi, poly in enumerate(me.polygons):
             c = int(face_labels[pi])
             if c in slot_map:
                 poly.material_index = slot_map[c]
+        log(f'Material indices written in {time.time() - t_w:.1f}s')
 
         me.update()
 
+        if self.remove_modifier:
+            try:
+                obj.modifiers.remove(obj.modifiers['KIRI_Edit_By_Colour_GN'])
+                log('Removed KIRI_Edit_By_Colour_GN modifier from source object')
+            except Exception as e:
+                log(f'Could not remove modifier: {e}')
+
         if self.do_separate:
+            log('Separating by material (can be slow for large K)...')
+            t_sep = time.time()
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
             context.view_layer.objects.active = obj
@@ -3124,7 +3173,9 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             except RuntimeError as e:
                 self.report({'WARNING'}, f'Separate failed: {e}')
             bpy.ops.object.mode_set(mode='OBJECT')
+            log(f'Separation done in {time.time() - t_sep:.1f}s')
 
+        log(f'=== DONE in {t_since()} — {len(slot_map)} non-empty clusters of {K} ===')
         self.report({'INFO'}, f'Auto split: {len(slot_map)} non-empty clusters of {K}')
         return {'FINISHED'}
 
@@ -3137,10 +3188,30 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         layout.prop(self, 'samples_per_face')
         layout.prop(self, 'use_hsv')
         layout.prop(self, 'do_separate')
+        layout.prop(self, 'remove_modifier')
         col = layout.column(align=True)
         col.label(text='Advanced:')
         col.prop(self, 'kmeans_iters')
         col.prop(self, 'kmeans_subsample')
+
+
+class SNA_OT_remove_ebc_modifier_from_selected(bpy.types.Operator):
+    bl_idname = 'sna.remove_ebc_modifier_from_selected'
+    bl_label = 'Remove EBC Modifier from Selected'
+    bl_description = 'Removes KIRI_Edit_By_Colour_GN from all selected mesh objects'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        n = 0
+        for o in context.selected_objects:
+            if o.type != 'MESH':
+                continue
+            m = o.modifiers.get('KIRI_Edit_By_Colour_GN')
+            if m is not None:
+                o.modifiers.remove(m)
+                n += 1
+        self.report({'INFO'}, f'Removed modifier from {n} objects')
+        return {'FINISHED'}
 
 
 def sna_auto_palette_interface(layout_function):
@@ -3148,11 +3219,14 @@ def sna_auto_palette_interface(layout_function):
     box.label(text='Auto Palette Split (k-means)', icon_value=string_to_icon('GROUP_VCOL'))
     obj = bpy.context.view_layer.objects.active
     mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN') if obj else None
-    if mod is None:
+    if mod is not None:
+        box.operator('sna.auto_palette_split', text='Auto Detect & Split',
+                     icon_value=string_to_icon('MOD_EXPLODE'))
+    else:
         box.label(text='Add Edit By Colour modifier first', icon_value=0)
-        return
-    box.operator('sna.auto_palette_split', text='Auto Detect & Split',
-                 icon_value=string_to_icon('MOD_EXPLODE'))
+    box.operator('sna.remove_ebc_modifier_from_selected',
+                 text='Remove EBC Modifier from Selected',
+                 icon_value=string_to_icon('TRASH'))
 
 
 def sna_palette_split_interface(layout_function):
@@ -3214,6 +3288,7 @@ def register():
     bpy.utils.register_class(SNA_OT_palette_remove)
     bpy.utils.register_class(SNA_OT_palette_split_and_colorize)
     bpy.utils.register_class(SNA_OT_auto_palette_split)
+    bpy.utils.register_class(SNA_OT_remove_ebc_modifier_from_selected)
     bpy.types.Scene.sna_palette_colors = bpy.props.CollectionProperty(type=SNA_PaletteColorItem)
     bpy.types.Scene.sna_palette_active_index = bpy.props.IntProperty(default=0)
 
@@ -3260,6 +3335,7 @@ def unregister():
     bpy.utils.unregister_class(SNA_OT_Link_Baked_Textures_Patch_067F8)
     del bpy.types.Scene.sna_palette_active_index
     del bpy.types.Scene.sna_palette_colors
+    bpy.utils.unregister_class(SNA_OT_remove_ebc_modifier_from_selected)
     bpy.utils.unregister_class(SNA_OT_auto_palette_split)
     bpy.utils.unregister_class(SNA_OT_palette_split_and_colorize)
     bpy.utils.unregister_class(SNA_OT_palette_remove)
