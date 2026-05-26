@@ -117,11 +117,45 @@ cluster.
    - **Samples per Face** — barycentric sample density (default 4).
    - **Cluster in HSV** — recommended on; off uses raw RGB euclidean.
    - **Separate by Material** — produce one mesh per cluster.
+   - **Remove EBC Modifier after Split** — drops the
+     `KIRI_Edit_By_Colour_GN` modifier from the source object before
+     separating, so the resulting child meshes do not inherit the
+     placeholder `KIRI_LOGO` Live Effect material that would otherwise
+     visually override your `EBC_Auto_*` colors.
    - Advanced: **K-means Iterations**, **Cluster Sample Cap** (random
      subsample of faces used to fit centroids — speeds up huge meshes).
 4. Result: N material slots + N separated meshes (some clusters may be
    empty if the requested K is higher than the actual color variety in
    the texture — those are skipped).
+
+### Progress logging
+The operator prints staged progress to the Blender system console
+(Window → Toggle System Console on Windows). Each line is tagged
+`[AutoPalette]` and includes elapsed time and ETA for the slow
+per-polygon sampling stage, so you can monitor a long run on
+multi-million-poly meshes without wondering if Blender froze.
+
+Example:
+```
+[AutoPalette] === Auto Palette Split started: K=64, samples=4, HSV=True ===
+[AutoPalette] Reading image pixels: 4096x4096 (16.78M px)...
+[AutoPalette] Image read in 1.2s
+[AutoPalette] Sampling 1600000 polygons (this is the slow part)...
+[AutoPalette]   sampling 5% (80000/1600000) elapsed 4.3s ETA 81.7s
+[AutoPalette] K-means done in 3.1s
+[AutoPalette] Assignment done in 5.2s
+[AutoPalette] === DONE in 95.3s — 58 non-empty clusters of 64 ===
+```
+
+### Cleaning up existing batches
+If you have already produced a set of split meshes (each carrying a
+copy of the `KIRI_Edit_By_Colour_GN` modifier from before the
+auto-removal option existed), use the **Remove EBC Modifier from
+Selected** button at the bottom of the Auto Palette Split section:
+1. Select all the result meshes in the Outliner (Shift-click or `A`).
+2. Click the button — the modifier is removed from every selected
+   mesh in one pass. The flat `EBC_Auto_*` materials become visible
+   as the Live Effect override is gone.
 
 ### Manual vs Auto — which to use
 - **Manual Palette Split** — when you know the exact filament colors your
