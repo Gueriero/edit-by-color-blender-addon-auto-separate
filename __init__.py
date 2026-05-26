@@ -1238,6 +1238,8 @@ class SNA_PT_EDIT_BY_COLOUR_BY_KIRI_ENGINE_955BF(bpy.types.Panel):
         layout.separator(factor=1.0)
         layout_function = layout
         sna_about_and_external_links_interface_function_8E1B8(layout_function, )
+        layout.separator(factor=1.0)
+        sna_palette_split_interface(layout)
 
 
 class SNA_OT_Open_Edit_By_Colour_Documentation_1Eac5(bpy.types.Operator):
@@ -2624,6 +2626,263 @@ class SNA_OT_Link_Baked_Textures_Patch_067F8(bpy.types.Operator):
         return context.window_manager.invoke_props_dialog(self, width=500)
 
 
+# ============================================================
+# Palette Split — quantize texture to manual palette + gradients
+# ============================================================
+
+class SNA_PaletteColorItem(bpy.types.PropertyGroup):
+    color: bpy.props.FloatVectorProperty(
+        name='Color', subtype='COLOR', size=3,
+        min=0.0, max=1.0, default=(0.5, 0.5, 0.5),
+    )
+    steps: bpy.props.IntProperty(
+        name='Gradient Steps', default=4, min=1, max=16,
+        description='How many tones to split this base color into',
+    )
+
+
+class SNA_UL_palette_colors(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, 'color', text='')
+        row.prop(item, 'steps', text='Steps')
+
+
+class SNA_OT_palette_add(bpy.types.Operator):
+    bl_idname = 'sna.palette_add'
+    bl_label = 'Add Palette Color'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        context.scene.sna_palette_colors.add()
+        context.scene.sna_palette_active_index = len(context.scene.sna_palette_colors) - 1
+        return {'FINISHED'}
+
+
+class SNA_OT_palette_remove(bpy.types.Operator):
+    bl_idname = 'sna.palette_remove'
+    bl_label = 'Remove Palette Color'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        coll = context.scene.sna_palette_colors
+        idx = context.scene.sna_palette_active_index
+        if 0 <= idx < len(coll):
+            coll.remove(idx)
+            context.scene.sna_palette_active_index = max(0, idx - 1)
+        return {'FINISHED'}
+
+
+def _sna_hsv_dist(a, b):
+    import math
+    dh = min(abs(a[0] - b[0]), 1.0 - abs(a[0] - b[0])) * 2.0
+    ds = a[1] - b[1]
+    dv = a[2] - b[2]
+    return math.sqrt(dh * dh + ds * ds + dv * dv)
+
+
+class SNA_OT_palette_split_and_colorize(bpy.types.Operator):
+    bl_idname = 'sna.palette_split_and_colorize'
+    bl_label = 'Split & Colorize by Palette'
+    bl_description = 'Sample texture per face, bin to nearest palette color + luminance bin, assign materials and separate by material'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    samples_per_face: bpy.props.IntProperty(
+        name='Samples per Face', default=7, min=1, max=64,
+        description='Barycentric samples averaged per face for accuracy',
+    )
+    do_separate: bpy.props.BoolProperty(
+        name='Separate by Material', default=True,
+        description='Split into individual mesh objects (one per color bucket) after assigning materials',
+    )
+
+    def execute(self, context):
+        import math, colorsys
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, 'No active mesh')
+            return {'CANCELLED'}
+
+        mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN')
+        if mod is None:
+            self.report({'ERROR'}, 'Add Edit By Colour modifier first')
+            return {'CANCELLED'}
+
+        try:
+            uv_name = mod['Socket_2']
+        except Exception:
+            uv_name = ''
+        try:
+            image = mod['Socket_4']
+        except Exception:
+            image = None
+
+        if not uv_name or uv_name not in obj.data.uv_layers:
+            self.report({'ERROR'}, 'UV Map not set in modifier')
+            return {'CANCELLED'}
+        if image is None:
+            self.report({'ERROR'}, 'Base Texture not set in modifier')
+            return {'CANCELLED'}
+
+        palette = list(context.scene.sna_palette_colors)
+        if not palette:
+            self.report({'ERROR'}, 'Palette empty — add colors first')
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        w, h = image.size[0], image.size[1]
+        if w == 0 or h == 0:
+            self.report({'ERROR'}, 'Image has zero size')
+            return {'CANCELLED'}
+        px = list(image.pixels)
+
+        def sample(u, v):
+            u = u - math.floor(u)
+            v = v - math.floor(v)
+            x = min(w - 1, int(u * w))
+            y = min(h - 1, int(v * h))
+            i = (y * w + x) * 4
+            return px[i], px[i+1], px[i+2]
+
+        n = max(1, self.samples_per_face)
+        bary_pts = []
+        k = int(math.ceil(math.sqrt(n)))
+        for i in range(1, k + 2):
+            for j in range(1, k - i + 3):
+                a = i / (k + 2)
+                b = j / (k + 2)
+                c = 1.0 - a - b
+                if c > 0:
+                    bary_pts.append((a, b, c))
+        if not bary_pts:
+            bary_pts = [(1/3, 1/3, 1/3)]
+        if len(bary_pts) > n:
+            bary_pts = bary_pts[:n]
+
+        pal_hsv = [colorsys.rgb_to_hsv(c.color[0], c.color[1], c.color[2]) for c in palette]
+
+        mat_index_map = {}
+        def get_mat_slot(base_idx, bin_idx):
+            key = (base_idx, bin_idx)
+            if key in mat_index_map:
+                return mat_index_map[key]
+            base = palette[base_idx]
+            steps = max(1, base.steps)
+            if steps == 1:
+                v_mul = 1.0
+            else:
+                v_mul = 0.3 + 0.7 * (bin_idx / (steps - 1))
+            br = base.color[0] * v_mul
+            bg = base.color[1] * v_mul
+            bb = base.color[2] * v_mul
+            mat_name = f'EBC_Pal_{base_idx}_{bin_idx}'
+            mat = bpy.data.materials.get(mat_name)
+            if mat is None:
+                mat = bpy.data.materials.new(mat_name)
+                mat.use_nodes = True
+                bsdf = None
+                for nd in mat.node_tree.nodes:
+                    if nd.type == 'BSDF_PRINCIPLED':
+                        bsdf = nd
+                        break
+                if bsdf is not None:
+                    bsdf.inputs['Base Color'].default_value = (br, bg, bb, 1.0)
+            mat.diffuse_color = (br, bg, bb, 1.0)
+            slot_idx = -1
+            for si, s in enumerate(obj.material_slots):
+                if s.material and s.material.name == mat.name:
+                    slot_idx = si
+                    break
+            if slot_idx < 0:
+                obj.data.materials.append(mat)
+                slot_idx = len(obj.material_slots) - 1
+            mat_index_map[key] = slot_idx
+            return slot_idx
+
+        me = obj.data
+        uv_layer = me.uv_layers[uv_name].data
+        for poly in me.polygons:
+            loop_indices = list(poly.loop_indices)
+            if len(loop_indices) < 3:
+                continue
+            avg_r = avg_g = avg_b = 0.0
+            cnt = 0
+            uv0 = uv_layer[loop_indices[0]].uv
+            for ti in range(1, len(loop_indices) - 1):
+                uv1 = uv_layer[loop_indices[ti]].uv
+                uv2 = uv_layer[loop_indices[ti + 1]].uv
+                for (a, b, c) in bary_pts:
+                    u = a * uv0[0] + b * uv1[0] + c * uv2[0]
+                    v = a * uv0[1] + b * uv1[1] + c * uv2[1]
+                    r, g, bl = sample(u, v)
+                    avg_r += r; avg_g += g; avg_b += bl
+                    cnt += 1
+            if cnt == 0:
+                continue
+            avg_r /= cnt; avg_g /= cnt; avg_b /= cnt
+
+            shv = colorsys.rgb_to_hsv(avg_r, avg_g, avg_b)
+            best_i = 0
+            best_d = float('inf')
+            for i, ph in enumerate(pal_hsv):
+                d = _sna_hsv_dist(shv, ph)
+                if shv[1] < 0.1 and ph[1] > 0.3:
+                    d += 0.5
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+
+            steps = max(1, palette[best_i].steps)
+            lum = 0.2126 * avg_r + 0.7152 * avg_g + 0.0722 * avg_b
+            bin_idx = min(steps - 1, max(0, int(lum * steps)))
+            poly.material_index = get_mat_slot(best_i, bin_idx)
+
+        me.update()
+
+        if self.do_separate:
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            try:
+                bpy.ops.mesh.separate(type='MATERIAL')
+            except RuntimeError as e:
+                self.report({'WARNING'}, f'Separate failed: {e}')
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        self.report({'INFO'}, f'Done: {len(mat_index_map)} color buckets')
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=350)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, 'samples_per_face')
+        layout.prop(self, 'do_separate')
+
+
+def sna_palette_split_interface(layout_function):
+    box = layout_function.box()
+    box.label(text='Palette Split (3D Print)', icon_value=string_to_icon('COLOR'))
+    obj = bpy.context.view_layer.objects.active
+    mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN') if obj else None
+    if mod is None:
+        box.label(text='Add Edit By Colour modifier first', icon_value=0)
+        return
+    row = box.row()
+    row.template_list('SNA_UL_palette_colors', '', bpy.context.scene, 'sna_palette_colors',
+                      bpy.context.scene, 'sna_palette_active_index', rows=4)
+    col = row.column(align=True)
+    col.operator('sna.palette_add', text='', icon_value=string_to_icon('ADD'))
+    col.operator('sna.palette_remove', text='', icon_value=string_to_icon('REMOVE'))
+    box.operator('sna.palette_split_and_colorize', text='Split & Colorize',
+                 icon_value=string_to_icon('MOD_EXPLODE'))
+
+
 def register():
     global _icons
     _icons = bpy.utils.previews.new()
@@ -2659,6 +2918,13 @@ def register():
     bpy.utils.register_class(SNA_OT_Bake_To_Patch_Fa828)
     bpy.utils.register_class(SNA_OT_Add_Bake_Patch_68526)
     bpy.utils.register_class(SNA_OT_Link_Baked_Textures_Patch_067F8)
+    bpy.utils.register_class(SNA_PaletteColorItem)
+    bpy.utils.register_class(SNA_UL_palette_colors)
+    bpy.utils.register_class(SNA_OT_palette_add)
+    bpy.utils.register_class(SNA_OT_palette_remove)
+    bpy.utils.register_class(SNA_OT_palette_split_and_colorize)
+    bpy.types.Scene.sna_palette_colors = bpy.props.CollectionProperty(type=SNA_PaletteColorItem)
+    bpy.types.Scene.sna_palette_active_index = bpy.props.IntProperty(default=0)
 
 
 def unregister():
@@ -2701,3 +2967,10 @@ def unregister():
     bpy.utils.unregister_class(SNA_OT_Bake_To_Patch_Fa828)
     bpy.utils.unregister_class(SNA_OT_Add_Bake_Patch_68526)
     bpy.utils.unregister_class(SNA_OT_Link_Baked_Textures_Patch_067F8)
+    del bpy.types.Scene.sna_palette_active_index
+    del bpy.types.Scene.sna_palette_colors
+    bpy.utils.unregister_class(SNA_OT_palette_split_and_colorize)
+    bpy.utils.unregister_class(SNA_OT_palette_remove)
+    bpy.utils.unregister_class(SNA_OT_palette_add)
+    bpy.utils.unregister_class(SNA_UL_palette_colors)
+    bpy.utils.unregister_class(SNA_PaletteColorItem)
