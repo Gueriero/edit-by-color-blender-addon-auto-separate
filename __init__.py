@@ -2900,7 +2900,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         description='Removes the KIRI_Edit_By_Colour_GN modifier from the result objects so their EBC_Auto materials show correctly',
     )
     progressive_separate: bpy.props.BoolProperty(
-        name='Progressive Separate (logged)', default=True,
+        name='Progressive Separate (logged)', default=False,
         description='Separate materials one by one with a console log per cluster. Slower but shows progress. Off = single fast bpy.ops.mesh.separate(MATERIAL) with no progress',
     )
 
@@ -3167,41 +3167,52 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         if self.do_separate and self.progressive_separate:
             log('Progressive separate: one material at a time...')
             t_sep = time.time()
-            unique_labels = sorted({int(face_labels[i]) for i in range(n_polys) if int(face_labels[i]) in slot_map})
-            # Keep the last cluster on the source object — no separate needed for it
+            unique_labels = sorted(set(int(x) for x in face_labels) & set(slot_map.keys()))
             to_split = unique_labels[:-1]
             total = len(to_split)
             log(f'  {total} separate calls planned (1 cluster stays on source)')
+            source_name = obj.name
+            bpy.ops.object.mode_set(mode='OBJECT')
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
             context.view_layer.objects.active = obj
             for ki, c in enumerate(to_split):
-                target_mi = slot_map[c]
-                bpy.ops.object.mode_set(mode='OBJECT')
-                # select polys with this material_index
-                sel_count = 0
-                for poly in obj.data.polygons:
-                    s = (poly.material_index == target_mi)
-                    poly.select = s
-                    if s:
-                        sel_count += 1
-                if sel_count == 0:
-                    continue
-                bpy.ops.object.mode_set(mode='EDIT')
-                bpy.ops.mesh.select_mode(type='FACE')
+                log(f'  >> iter {ki+1}/{total} cluster={c}')
                 try:
+                    cur_obj = bpy.data.objects.get(source_name)
+                    if cur_obj is None:
+                        log(f'  source "{source_name}" lost — stopping'); break
+                    # ensure object mode + only source selected/active
+                    if context.mode != 'OBJECT':
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    bpy.ops.object.select_all(action='DESELECT')
+                    cur_obj.select_set(True)
+                    context.view_layer.objects.active = cur_obj
+                    target_mi = slot_map[c]
+                    # fast batched select via foreach_set
+                    n_poly_now = len(cur_obj.data.polygons)
+                    if n_poly_now == 0:
+                        log(f'  source has 0 polys, stopping'); break
+                    mi_arr = np.empty(n_poly_now, dtype=np.int32)
+                    cur_obj.data.polygons.foreach_get('material_index', mi_arr)
+                    sel_arr = (mi_arr == target_mi)
+                    sel_count = int(sel_arr.sum())
+                    if sel_count == 0:
+                        log(f'  cluster {c} not found in source, skip')
+                        continue
+                    cur_obj.data.polygons.foreach_set('select', sel_arr.astype(np.int32))
+                    cur_obj.data.update()
+                    bpy.ops.object.mode_set(mode='EDIT')
                     bpy.ops.mesh.separate(type='SELECTED')
-                except RuntimeError as e:
-                    log(f'  separate failed for cluster {c}: {e}')
-                bpy.ops.object.mode_set(mode='OBJECT')
-                # restore selection so source stays active for next iter
-                for o in list(context.selected_objects):
-                    o.select_set(False)
-                obj.select_set(True)
-                context.view_layer.objects.active = obj
-                elapsed = time.time() - t_sep
-                eta = elapsed * (total - (ki + 1)) / max(ki + 1, 1)
-                log(f'  separated {ki+1}/{total} (cluster {c}, {sel_count} faces) elapsed {elapsed:.1f}s ETA {eta:.1f}s')
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    elapsed = time.time() - t_sep
+                    eta = elapsed * (total - (ki + 1)) / max(ki + 1, 1)
+                    log(f'  separated {ki+1}/{total} (cluster {c}, {sel_count} faces) elapsed {elapsed:.1f}s ETA {eta:.1f}s')
+                except Exception as e:
+                    log(f'  ERROR on iter {ki+1} cluster {c}: {type(e).__name__}: {e}')
+                    # ensure we're back in object mode for next iter
+                    try: bpy.ops.object.mode_set(mode='OBJECT')
+                    except Exception: pass
             log(f'Progressive separation done in {time.time() - t_sep:.1f}s')
 
         elif self.do_separate:
