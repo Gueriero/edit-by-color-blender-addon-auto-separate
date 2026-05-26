@@ -2899,6 +2899,10 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         name='Remove EBC Modifier after Split', default=True,
         description='Removes the KIRI_Edit_By_Colour_GN modifier from the result objects so their EBC_Auto materials show correctly',
     )
+    progressive_separate: bpy.props.BoolProperty(
+        name='Progressive Separate (logged)', default=True,
+        description='Separate materials one by one with a console log per cluster. Slower but shows progress. Off = single fast bpy.ops.mesh.separate(MATERIAL) with no progress',
+    )
 
     def execute(self, context):
         import math, colorsys, random, time
@@ -3160,8 +3164,48 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             except Exception as e:
                 log(f'Could not remove modifier: {e}')
 
-        if self.do_separate:
-            log('Separating by material (can be slow for large K)...')
+        if self.do_separate and self.progressive_separate:
+            log('Progressive separate: one material at a time...')
+            t_sep = time.time()
+            unique_labels = sorted({int(face_labels[i]) for i in range(n_polys) if int(face_labels[i]) in slot_map})
+            # Keep the last cluster on the source object — no separate needed for it
+            to_split = unique_labels[:-1]
+            total = len(to_split)
+            log(f'  {total} separate calls planned (1 cluster stays on source)')
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+            for ki, c in enumerate(to_split):
+                target_mi = slot_map[c]
+                bpy.ops.object.mode_set(mode='OBJECT')
+                # select polys with this material_index
+                sel_count = 0
+                for poly in obj.data.polygons:
+                    s = (poly.material_index == target_mi)
+                    poly.select = s
+                    if s:
+                        sel_count += 1
+                if sel_count == 0:
+                    continue
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_mode(type='FACE')
+                try:
+                    bpy.ops.mesh.separate(type='SELECTED')
+                except RuntimeError as e:
+                    log(f'  separate failed for cluster {c}: {e}')
+                bpy.ops.object.mode_set(mode='OBJECT')
+                # restore selection so source stays active for next iter
+                for o in list(context.selected_objects):
+                    o.select_set(False)
+                obj.select_set(True)
+                context.view_layer.objects.active = obj
+                elapsed = time.time() - t_sep
+                eta = elapsed * (total - (ki + 1)) / max(ki + 1, 1)
+                log(f'  separated {ki+1}/{total} (cluster {c}, {sel_count} faces) elapsed {elapsed:.1f}s ETA {eta:.1f}s')
+            log(f'Progressive separation done in {time.time() - t_sep:.1f}s')
+
+        elif self.do_separate:
+            log('Separating by material (single blocking op, no progress)...')
             t_sep = time.time()
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
@@ -3188,6 +3232,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         layout.prop(self, 'samples_per_face')
         layout.prop(self, 'use_hsv')
         layout.prop(self, 'do_separate')
+        layout.prop(self, 'progressive_separate')
         layout.prop(self, 'remove_modifier')
         col = layout.column(align=True)
         col.label(text='Advanced:')
