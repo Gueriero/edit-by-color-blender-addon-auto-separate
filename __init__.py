@@ -1240,6 +1240,8 @@ class SNA_PT_EDIT_BY_COLOUR_BY_KIRI_ENGINE_955BF(bpy.types.Panel):
         sna_about_and_external_links_interface_function_8E1B8(layout_function, )
         layout.separator(factor=1.0)
         sna_palette_split_interface(layout)
+        layout.separator(factor=1.0)
+        sna_auto_palette_interface(layout)
 
 
 class SNA_OT_Open_Edit_By_Colour_Documentation_1Eac5(bpy.types.Operator):
@@ -2865,6 +2867,289 @@ class SNA_OT_palette_split_and_colorize(bpy.types.Operator):
         layout.prop(self, 'do_separate')
 
 
+class SNA_OT_auto_palette_split(bpy.types.Operator):
+    bl_idname = 'sna.auto_palette_split'
+    bl_label = 'Auto Palette Split'
+    bl_description = 'Automatically detect dominant colors in the texture via k-means and split mesh into N material buckets'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    num_clusters: bpy.props.IntProperty(
+        name='Total Colors', default=16, min=2, max=256,
+        description='How many color buckets to produce (each becomes one material / mesh)',
+    )
+    samples_per_face: bpy.props.IntProperty(
+        name='Samples per Face', default=4, min=1, max=64,
+        description='Barycentric samples averaged per face',
+    )
+    kmeans_iters: bpy.props.IntProperty(
+        name='K-means Iterations', default=20, min=2, max=100,
+    )
+    kmeans_subsample: bpy.props.IntProperty(
+        name='Cluster Sample Cap', default=20000, min=500, max=200000,
+        description='Cap number of faces used to compute clusters (random subsample). Speeds up large meshes',
+    )
+    use_hsv: bpy.props.BoolProperty(
+        name='Cluster in HSV', default=True,
+        description='K-means in HSV space (better perceptual grouping). Off = RGB',
+    )
+    do_separate: bpy.props.BoolProperty(
+        name='Separate by Material', default=True,
+    )
+
+    def execute(self, context):
+        import math, colorsys, random
+        try:
+            import numpy as np
+        except Exception:
+            self.report({'ERROR'}, 'numpy not available in this Blender build')
+            return {'CANCELLED'}
+
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, 'No active mesh')
+            return {'CANCELLED'}
+
+        mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN')
+        if mod is None:
+            self.report({'ERROR'}, 'Add Edit By Colour modifier first')
+            return {'CANCELLED'}
+
+        try:
+            uv_name = mod['Socket_2']
+        except Exception:
+            uv_name = ''
+        try:
+            image = mod['Socket_4']
+        except Exception:
+            image = None
+
+        if not uv_name or uv_name not in obj.data.uv_layers:
+            self.report({'ERROR'}, 'UV Map not set in modifier')
+            return {'CANCELLED'}
+        if image is None:
+            self.report({'ERROR'}, 'Base Texture not set in modifier')
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        w, h = image.size[0], image.size[1]
+        if w == 0 or h == 0:
+            self.report({'ERROR'}, 'Image has zero size')
+            return {'CANCELLED'}
+
+        # Read image pixels into numpy once
+        npx = np.empty(len(image.pixels), dtype=np.float32)
+        image.pixels.foreach_get(npx)
+        img = npx.reshape(h, w, 4)[:, :, :3]
+
+        # Barycentric sample points
+        n = max(1, self.samples_per_face)
+        bary_pts = []
+        k = int(math.ceil(math.sqrt(n)))
+        for i in range(1, k + 2):
+            for j in range(1, k - i + 3):
+                a = i / (k + 2)
+                b = j / (k + 2)
+                c = 1.0 - a - b
+                if c > 0:
+                    bary_pts.append((a, b, c))
+        if not bary_pts:
+            bary_pts = [(1/3, 1/3, 1/3)]
+        if len(bary_pts) > n:
+            bary_pts = bary_pts[:n]
+        bary = np.array(bary_pts, dtype=np.float32)  # (S, 3)
+
+        me = obj.data
+        uv_layer = me.uv_layers[uv_name].data
+        n_polys = len(me.polygons)
+        if n_polys == 0:
+            self.report({'ERROR'}, 'Mesh has no polygons')
+            return {'CANCELLED'}
+
+        # Per-face average color
+        face_colors = np.zeros((n_polys, 3), dtype=np.float32)
+
+        # Process polys — for tri/quad fast path, fallback fan
+        for pi, poly in enumerate(me.polygons):
+            li = poly.loop_indices
+            ln = poly.loop_total
+            if ln < 3:
+                continue
+            uv0 = uv_layer[li[0]].uv
+            acc_r = acc_g = acc_b = 0.0
+            cnt = 0
+            for ti in range(1, ln - 1):
+                uv1 = uv_layer[li[ti]].uv
+                uv2 = uv_layer[li[ti + 1]].uv
+                us = bary[:, 0] * uv0[0] + bary[:, 1] * uv1[0] + bary[:, 2] * uv2[0]
+                vs = bary[:, 0] * uv0[1] + bary[:, 1] * uv1[1] + bary[:, 2] * uv2[1]
+                us = us - np.floor(us)
+                vs = vs - np.floor(vs)
+                xs = np.minimum((us * w).astype(np.int32), w - 1)
+                ys = np.minimum((vs * h).astype(np.int32), h - 1)
+                cols = img[ys, xs]
+                acc_r += float(cols[:, 0].sum())
+                acc_g += float(cols[:, 1].sum())
+                acc_b += float(cols[:, 2].sum())
+                cnt += len(bary)
+            if cnt > 0:
+                face_colors[pi, 0] = acc_r / cnt
+                face_colors[pi, 1] = acc_g / cnt
+                face_colors[pi, 2] = acc_b / cnt
+
+        # Convert to clustering space
+        def rgb_to_hsv_np(arr):
+            r, g, b = arr[:, 0], arr[:, 1], arr[:, 2]
+            mx = np.max(arr, axis=1)
+            mn = np.min(arr, axis=1)
+            d = mx - mn
+            s = np.where(mx > 0, d / np.maximum(mx, 1e-8), 0.0)
+            rc = np.where(d > 0, (mx - r) / np.maximum(d, 1e-8), 0.0)
+            gc = np.where(d > 0, (mx - g) / np.maximum(d, 1e-8), 0.0)
+            bc = np.where(d > 0, (mx - b) / np.maximum(d, 1e-8), 0.0)
+            h_ = np.where(r == mx, bc - gc,
+                  np.where(g == mx, 2.0 + rc - bc, 4.0 + gc - rc))
+            h_ = (h_ / 6.0) % 1.0
+            return np.stack([h_, s, mx], axis=1)
+
+        if self.use_hsv:
+            cluster_data = rgb_to_hsv_np(face_colors)
+            # Weight: hue cyclic distance handled via cos/sin to keep euclidean kmeans valid
+            hx = np.cos(cluster_data[:, 0] * 2.0 * math.pi) * cluster_data[:, 1]
+            hy = np.sin(cluster_data[:, 0] * 2.0 * math.pi) * cluster_data[:, 1]
+            cluster_data = np.stack([hx, hy, cluster_data[:, 2]], axis=1)
+        else:
+            cluster_data = face_colors
+
+        # Subsample for k-means
+        N = cluster_data.shape[0]
+        cap = min(N, max(self.num_clusters * 50, self.kmeans_subsample))
+        if N > cap:
+            idx = np.random.choice(N, cap, replace=False)
+            sample = cluster_data[idx]
+        else:
+            sample = cluster_data
+
+        K = self.num_clusters
+        # k-means++ init
+        rng = np.random.default_rng(42)
+        first = rng.integers(0, sample.shape[0])
+        centers = [sample[first]]
+        dist_sq = np.full(sample.shape[0], np.inf)
+        for _ in range(K - 1):
+            diff = sample - centers[-1]
+            d2 = np.sum(diff * diff, axis=1)
+            dist_sq = np.minimum(dist_sq, d2)
+            probs = dist_sq / max(dist_sq.sum(), 1e-12)
+            nxt = rng.choice(sample.shape[0], p=probs)
+            centers.append(sample[nxt])
+        centers = np.stack(centers, axis=0)
+
+        # Lloyd iterations
+        for it in range(self.kmeans_iters):
+            d2 = np.sum((sample[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+            labels = np.argmin(d2, axis=1)
+            new_centers = np.zeros_like(centers)
+            counts = np.zeros(K, dtype=np.int32)
+            for c in range(K):
+                mask = labels == c
+                if mask.any():
+                    new_centers[c] = sample[mask].mean(axis=0)
+                    counts[c] = int(mask.sum())
+                else:
+                    new_centers[c] = centers[c]
+            shift = np.linalg.norm(new_centers - centers)
+            centers = new_centers
+            if shift < 1e-5:
+                break
+
+        # Assign all faces to nearest center
+        d2_all = np.sum((cluster_data[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+        face_labels = np.argmin(d2_all, axis=1)
+
+        # Compute representative RGB color per cluster from face_colors
+        cluster_rgb = np.zeros((K, 3), dtype=np.float32)
+        for c in range(K):
+            mask = face_labels == c
+            if mask.any():
+                cluster_rgb[c] = face_colors[mask].mean(axis=0)
+
+        # Create materials and assign
+        slot_map = {}
+        for c in range(K):
+            if not (face_labels == c).any():
+                continue
+            r, g, b = float(cluster_rgb[c, 0]), float(cluster_rgb[c, 1]), float(cluster_rgb[c, 2])
+            mat_name = f'EBC_Auto_{c:03d}'
+            mat = bpy.data.materials.get(mat_name)
+            if mat is None:
+                mat = bpy.data.materials.new(mat_name)
+                mat.use_nodes = True
+                for nd in mat.node_tree.nodes:
+                    if nd.type == 'BSDF_PRINCIPLED':
+                        nd.inputs['Base Color'].default_value = (r, g, b, 1.0)
+                        break
+            mat.diffuse_color = (r, g, b, 1.0)
+            slot_idx = -1
+            for si, s in enumerate(obj.material_slots):
+                if s.material and s.material.name == mat.name:
+                    slot_idx = si
+                    break
+            if slot_idx < 0:
+                obj.data.materials.append(mat)
+                slot_idx = len(obj.material_slots) - 1
+            slot_map[c] = slot_idx
+
+        for pi, poly in enumerate(me.polygons):
+            c = int(face_labels[pi])
+            if c in slot_map:
+                poly.material_index = slot_map[c]
+
+        me.update()
+
+        if self.do_separate:
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            try:
+                bpy.ops.mesh.separate(type='MATERIAL')
+            except RuntimeError as e:
+                self.report({'WARNING'}, f'Separate failed: {e}')
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        self.report({'INFO'}, f'Auto split: {len(slot_map)} non-empty clusters of {K}')
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, 'num_clusters')
+        layout.prop(self, 'samples_per_face')
+        layout.prop(self, 'use_hsv')
+        layout.prop(self, 'do_separate')
+        col = layout.column(align=True)
+        col.label(text='Advanced:')
+        col.prop(self, 'kmeans_iters')
+        col.prop(self, 'kmeans_subsample')
+
+
+def sna_auto_palette_interface(layout_function):
+    box = layout_function.box()
+    box.label(text='Auto Palette Split (k-means)', icon_value=string_to_icon('GROUP_VCOL'))
+    obj = bpy.context.view_layer.objects.active
+    mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN') if obj else None
+    if mod is None:
+        box.label(text='Add Edit By Colour modifier first', icon_value=0)
+        return
+    box.operator('sna.auto_palette_split', text='Auto Detect & Split',
+                 icon_value=string_to_icon('MOD_EXPLODE'))
+
+
 def sna_palette_split_interface(layout_function):
     box = layout_function.box()
     box.label(text='Palette Split (3D Print)', icon_value=string_to_icon('COLOR'))
@@ -2923,6 +3208,7 @@ def register():
     bpy.utils.register_class(SNA_OT_palette_add)
     bpy.utils.register_class(SNA_OT_palette_remove)
     bpy.utils.register_class(SNA_OT_palette_split_and_colorize)
+    bpy.utils.register_class(SNA_OT_auto_palette_split)
     bpy.types.Scene.sna_palette_colors = bpy.props.CollectionProperty(type=SNA_PaletteColorItem)
     bpy.types.Scene.sna_palette_active_index = bpy.props.IntProperty(default=0)
 
@@ -2969,6 +3255,7 @@ def unregister():
     bpy.utils.unregister_class(SNA_OT_Link_Baked_Textures_Patch_067F8)
     del bpy.types.Scene.sna_palette_active_index
     del bpy.types.Scene.sna_palette_colors
+    bpy.utils.unregister_class(SNA_OT_auto_palette_split)
     bpy.utils.unregister_class(SNA_OT_palette_split_and_colorize)
     bpy.utils.unregister_class(SNA_OT_palette_remove)
     bpy.utils.unregister_class(SNA_OT_palette_add)

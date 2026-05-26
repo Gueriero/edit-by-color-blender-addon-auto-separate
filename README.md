@@ -84,6 +84,55 @@ to configure.
   black. If you actually want a pure-black darkest bin, edit the
   `v_mul` line in `__init__.py`.
 
+## Fork additions — Auto Palette Split (k-means)
+
+A second new section below **Palette Split**: **Auto Palette Split
+(k-means)**. Instead of picking colors manually, you specify a target
+number of buckets (e.g. 16, 64, 128) and the operator finds dominant
+colors in the texture automatically and assigns each face to its nearest
+cluster.
+
+### How it works
+1. Reads the same UV Map / Base Texture as the manual mode (from the
+   `KIRI_Edit_By_Colour_GN` modifier).
+2. Samples an average RGB color per face (barycentric points inside each
+   UV triangle).
+3. Runs **k-means++** clustering (`K` = requested number of colors) on a
+   random subsample of faces for speed. Iterates Lloyd's algorithm until
+   centroids stabilise.
+4. By default clusters in **HSV space** (hue mapped to circular x/y to
+   keep euclidean k-means valid) so red ↔ red is closer than red ↔ blue
+   regardless of luminance. RGB mode is available as a toggle.
+5. Assigns every face to its nearest cluster, creates one flat material
+   per cluster (`EBC_Auto_NNN`) with `Base Color` = cluster centroid, and
+   optionally separates by material.
+
+### Usage
+1. Object Mode with active textured mesh and Edit By Colour modifier set
+   up (UV Map + Base Texture).
+2. Bottom of the panel → **Auto Palette Split (k-means)** →
+   **Auto Detect & Split**.
+3. In the dialog:
+   - **Total Colors** — number of buckets to produce (2..256).
+   - **Samples per Face** — barycentric sample density (default 4).
+   - **Cluster in HSV** — recommended on; off uses raw RGB euclidean.
+   - **Separate by Material** — produce one mesh per cluster.
+   - Advanced: **K-means Iterations**, **Cluster Sample Cap** (random
+     subsample of faces used to fit centroids — speeds up huge meshes).
+4. Result: N material slots + N separated meshes (some clusters may be
+   empty if the requested K is higher than the actual color variety in
+   the texture — those are skipped).
+
+### Manual vs Auto — which to use
+- **Manual Palette Split** — when you know the exact filament colors your
+  printer has and want full control over base hues and tonal steps per
+  hue.
+- **Auto Palette Split** — when you want the addon to discover the
+  palette from the texture itself, or when you need many buckets (64,
+  128…) that would be tedious to define manually.
+
+Both blocks are independent. You can run either or both.
+
 ## Acknowledgement:
 Thanks to everybody who contributes to this good work from the KIRI Engine team.
 
