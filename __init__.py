@@ -3064,9 +3064,14 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             if shift < 1e-5:
                 break
 
-        # Assign all faces to nearest center
-        d2_all = np.sum((cluster_data[:, None, :] - centers[None, :, :]) ** 2, axis=2)
-        face_labels = np.argmin(d2_all, axis=1)
+        # Assign all faces to nearest center (chunked to avoid OOM on big meshes)
+        face_labels = np.empty(cluster_data.shape[0], dtype=np.int32)
+        chunk = 50000
+        for start in range(0, cluster_data.shape[0], chunk):
+            end = min(start + chunk, cluster_data.shape[0])
+            seg = cluster_data[start:end]
+            d2_seg = np.sum((seg[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+            face_labels[start:end] = np.argmin(d2_seg, axis=1)
 
         # Compute representative RGB color per cluster from face_colors
         cluster_rgb = np.zeros((K, 3), dtype=np.float32)
