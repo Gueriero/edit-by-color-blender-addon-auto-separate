@@ -2931,6 +2931,10 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         description='Minimum width along the smallest principal axis (oriented bounding box). Catches thin features regardless of orientation. 0 = disabled. Recommended 3mm for 0.4mm nozzle prints',
         unit='LENGTH', precision=4,
     )
+    erosion_passes: bpy.props.IntProperty(
+        name='Erosion Passes', default=0, min=0, max=20,
+        description='After bbox-based merging, run N morphological erosion passes. Each pass flips faces whose majority edge-neighbors belong to a different cluster. Removes thin features and dots independent of topology. 1-3 passes typical, 5+ for aggressive smoothing',
+    )
 
     _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
@@ -3517,6 +3521,43 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             face_labels[faces] = majority
             reassigned += len(faces)
         log(f'  reassigned {reassigned} faces across {len(small_roots)} islands')
+
+        # Optional morphological erosion passes
+        passes = int(getattr(self, 'erosion_passes', 0))
+        if passes > 0:
+            yield ('Merging islands: erosion setup...', 66)
+            all_a = np.concatenate([pair_a, pair_b])
+            all_b = np.concatenate([pair_b, pair_a])
+            sort_idx = np.argsort(all_a, kind='stable')
+            sorted_a = all_a[sort_idx]
+            sorted_b = all_b[sort_idx]
+            unique_faces, start_idx, counts = np.unique(sorted_a, return_index=True, return_counts=True)
+            uf_list = unique_faces.tolist()
+            st_list = start_idx.tolist()
+            ct_list = counts.tolist()
+            erosion_total = 0
+            for pass_i in range(passes):
+                yield (f'Erosion pass {pass_i+1}/{passes}...', min(68 + pass_i, 72))
+                neighbor_labels = face_labels[sorted_b]
+                new_labels = face_labels.copy()
+                changed = 0
+                for fi, st, ct in zip(uf_list, st_list, ct_list):
+                    nb = neighbor_labels[st:st + ct]
+                    cur = int(face_labels[fi])
+                    same = int((nb == cur).sum())
+                    if same * 2 < ct:
+                        mn = int(np.bincount(nb).argmax())
+                        if mn != cur:
+                            new_labels[fi] = mn
+                            changed += 1
+                face_labels[:] = new_labels
+                erosion_total += changed
+                log(f'  erosion pass {pass_i+1}: changed {changed} faces')
+                if changed == 0:
+                    log('  erosion converged, stopping early')
+                    break
+            log(f'  total erosion changes: {erosion_total}')
+            reassigned += erosion_total
         return reassigned
 
     def draw(self, context):
@@ -3538,6 +3579,8 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         sub.label(text='Oriented bbox / face count:')
         sub.prop(self, 'min_island_feature_width')
         sub.prop(self, 'min_island_face_count')
+        sub.label(text='Morphological smoothing:')
+        sub.prop(self, 'erosion_passes')
         col = layout.column(align=True)
         col.label(text='Advanced:')
         col.prop(self, 'kmeans_iters')
@@ -3688,6 +3731,7 @@ class SNA_OT_test_merge_islands(bpy.types.Operator):
         stub.min_island_size_z = 0.0   # plane has no Z extent — disable
         stub.min_island_face_count = 0
         stub.min_island_feature_width = 0.0  # disable OBB check for plane test
+        stub.erosion_passes = 0
 
         gen = SNA_OT_auto_palette_split._merge_islands_gen(stub, plane, face_labels, p)
         reassigned = 0
