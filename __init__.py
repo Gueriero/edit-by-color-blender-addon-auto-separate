@@ -2933,7 +2933,11 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
     )
     erosion_passes: bpy.props.IntProperty(
         name='Erosion Passes', default=0, min=0, max=20,
-        description='After bbox-based merging, run N morphological erosion passes. Each pass flips faces whose majority edge-neighbors belong to a different cluster. Removes thin features and dots independent of topology. 1-3 passes typical, 5+ for aggressive smoothing',
+        description='After bbox-based merging, run N morphological erosion passes. Each pass flips faces whose same-cluster neighbor fraction is below the strength threshold. 1-3 passes typical, 5+ for aggressive smoothing',
+    )
+    erosion_strength: bpy.props.FloatProperty(
+        name='Erosion Strength', default=0.7, min=0.5, max=0.99, precision=2,
+        description='Flip face if (same-cluster neighbors / total neighbors) < this value. 0.5 = strict minority only (cant erode 1-face wide strips on triangulated meshes since they have 2/3 same neighbors). 0.7 = catches 1-face strips on triangles. 0.8+ erodes wider features faster',
     )
 
     _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
@@ -3535,7 +3539,10 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             uf_list = unique_faces.tolist()
             st_list = start_idx.tolist()
             ct_list = counts.tolist()
+            strength = float(getattr(self, 'erosion_strength', 0.7))
+            log(f'  erosion strength threshold = {strength}')
             erosion_total = 0
+            prev_changed = None
             for pass_i in range(passes):
                 yield (f'Erosion pass {pass_i+1}/{passes}...', min(68 + pass_i, 72))
                 neighbor_labels = face_labels[sorted_b]
@@ -3545,7 +3552,8 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
                     nb = neighbor_labels[st:st + ct]
                     cur = int(face_labels[fi])
                     same = int((nb == cur).sum())
-                    if same * 2 < ct:
+                    # flip if same-fraction below strength
+                    if ct > 0 and (same / ct) < strength:
                         mn = int(np.bincount(nb).argmax())
                         if mn != cur:
                             new_labels[fi] = mn
@@ -3556,6 +3564,11 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
                 if changed == 0:
                     log('  erosion converged, stopping early')
                     break
+                # Oscillation detection: if change count is plateauing high, stop
+                if prev_changed is not None and abs(changed - prev_changed) < max(100, prev_changed // 50):
+                    log(f'  erosion oscillating around {changed} flips/pass, stopping (limit cycle)')
+                    break
+                prev_changed = changed
             log(f'  total erosion changes: {erosion_total}')
             reassigned += erosion_total
         return reassigned
@@ -3581,6 +3594,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         sub.prop(self, 'min_island_face_count')
         sub.label(text='Morphological smoothing:')
         sub.prop(self, 'erosion_passes')
+        sub.prop(self, 'erosion_strength')
         col = layout.column(align=True)
         col.label(text='Advanced:')
         col.prop(self, 'kmeans_iters')
@@ -3732,6 +3746,7 @@ class SNA_OT_test_merge_islands(bpy.types.Operator):
         stub.min_island_face_count = 0
         stub.min_island_feature_width = 0.0  # disable OBB check for plane test
         stub.erosion_passes = 0
+        stub.erosion_strength = 0.7
 
         gen = SNA_OT_auto_palette_split._merge_islands_gen(stub, plane, face_labels, p)
         reassigned = 0

@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "edit_by_color_by_kiri_engine"
-version = "2.9.0"
+version = "2.10.0"
 name = "Edit By Color by KIRI Engine"
 tagline = "Select and edit meshes by colour"
 maintainer = "Blue Nile 3D"
