@@ -3556,6 +3556,87 @@ class SNA_OT_test_progressive_separate(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SNA_OT_test_merge_islands(bpy.types.Operator):
+    bl_idname = 'sna.test_merge_islands'
+    bl_label = 'Self-Test: Merge Small Islands'
+    bl_description = 'Builds a 200mm grid plane with 1-cell and 3x3-cell off-cluster islands, runs the island merge logic with 15mm threshold, asserts the small island merged and the big one survived. Reports PASS/FAIL in console'
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        import numpy as np
+
+        def p(msg):
+            print(f'[TestMerge] {msg}', flush=True)
+
+        p('=== test start ===')
+        bpy.ops.object.select_all(action='DESELECT')
+        bpy.ops.mesh.primitive_plane_add(size=0.2, location=(50, 50, 50))
+        plane = context.active_object
+        plane.name = '_ebc_test_merge_plane'
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.subdivide(number_cuts=19)
+        bpy.ops.object.mode_set(mode='OBJECT')
+        mesh = plane.data
+        n = len(mesh.polygons)
+        p(f'plane: {n} polys (expected 400)')
+
+        face_labels = np.zeros(n, dtype=np.int32)
+        a_count = b_count = 0
+        b_xs = [0.035, 0.045, 0.055]
+        b_ys = [-0.035, -0.025, -0.015]
+        for pi, poly in enumerate(mesh.polygons):
+            cx, cy, _ = poly.center
+            face_labels[pi] = 1 if cx > 0 else 0
+            if abs(cx - 0.015) < 0.002 and abs(cy - 0.005) < 0.002:
+                face_labels[pi] = 0
+                a_count += 1
+            elif (any(abs(cx - x) < 0.002 for x in b_xs)
+                  and any(abs(cy - y) < 0.002 for y in b_ys)):
+                face_labels[pi] = 0
+                b_count += 1
+        n_l0_before = int((face_labels == 0).sum())
+        n_l1_before = int((face_labels == 1).sum())
+        p(f'before: A={a_count} faces, B={b_count} faces, label0={n_l0_before}, label1={n_l1_before}')
+
+        class _Stub:
+            pass
+        stub = _Stub()
+        stub.min_island_size = 0.015  # 15mm
+        stub.min_island_face_count = 0
+
+        gen = SNA_OT_auto_palette_split._merge_islands_gen(stub, plane, face_labels, p)
+        reassigned = 0
+        try:
+            while True:
+                next(gen)
+        except StopIteration as si:
+            reassigned = si.value if si.value is not None else 0
+        p(f'reassigned: {reassigned}')
+
+        n_l0 = int((face_labels == 0).sum())
+        n_l1 = int((face_labels == 1).sum())
+        p(f'after: label0={n_l0}, label1={n_l1}')
+
+        expected_reassigned = a_count
+        expected_l0 = n_l0_before - a_count
+        expected_l1 = n_l1_before + a_count
+        ok = (reassigned == expected_reassigned
+              and n_l0 == expected_l0
+              and n_l1 == expected_l1
+              and a_count == 1
+              and b_count == 9)
+
+        if ok:
+            p('=== PASS ===')
+            self.report({'INFO'}, 'TestMerge PASS')
+        else:
+            p(f'=== FAIL: expected reassigned={expected_reassigned} label0={expected_l0} label1={expected_l1}, a_count={a_count} b_count={b_count} ===')
+            self.report({'ERROR'}, 'TestMerge FAIL')
+
+        bpy.data.objects.remove(plane, do_unlink=True)
+        return {'FINISHED'}
+
+
 class SNA_OT_remove_ebc_modifier_from_selected(bpy.types.Operator):
     bl_idname = 'sna.remove_ebc_modifier_from_selected'
     bl_label = 'Remove EBC Modifier from Selected'
@@ -3588,6 +3669,9 @@ def sna_auto_palette_interface(layout_function):
     box.operator('sna.remove_ebc_modifier_from_selected',
                  text='Remove EBC Modifier from Selected',
                  icon_value=string_to_icon('TRASH'))
+    box.operator('sna.test_merge_islands',
+                 text='Self-Test: Merge Small Islands',
+                 icon_value=string_to_icon('EXPERIMENTAL'))
 
 
 def sna_palette_split_interface(layout_function):
@@ -3651,6 +3735,7 @@ def register():
     bpy.utils.register_class(SNA_OT_auto_palette_split)
     bpy.utils.register_class(SNA_OT_remove_ebc_modifier_from_selected)
     bpy.utils.register_class(SNA_OT_test_progressive_separate)
+    bpy.utils.register_class(SNA_OT_test_merge_islands)
     bpy.types.Scene.sna_palette_colors = bpy.props.CollectionProperty(type=SNA_PaletteColorItem)
     bpy.types.Scene.sna_palette_active_index = bpy.props.IntProperty(default=0)
 
@@ -3697,6 +3782,7 @@ def unregister():
     bpy.utils.unregister_class(SNA_OT_Link_Baked_Textures_Patch_067F8)
     del bpy.types.Scene.sna_palette_active_index
     del bpy.types.Scene.sna_palette_colors
+    bpy.utils.unregister_class(SNA_OT_test_merge_islands)
     bpy.utils.unregister_class(SNA_OT_test_progressive_separate)
     bpy.utils.unregister_class(SNA_OT_remove_ebc_modifier_from_selected)
     bpy.utils.unregister_class(SNA_OT_auto_palette_split)
