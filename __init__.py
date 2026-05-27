@@ -2904,131 +2904,193 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         description='Separate materials one by one with a console log per cluster. Slower but shows progress. Off = single fast bpy.ops.mesh.separate(MATERIAL) with no progress',
     )
 
+    _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
     def execute(self, context):
-        import math, colorsys, random, time
         try:
             import numpy as np
         except Exception:
             self.report({'ERROR'}, 'numpy not available in this Blender build')
             return {'CANCELLED'}
 
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, 'No active mesh'); return {'CANCELLED'}
+        mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN')
+        if mod is None:
+            self.report({'ERROR'}, 'Add Edit By Colour modifier first'); return {'CANCELLED'}
+        try: uv_name = mod['Socket_2']
+        except Exception: uv_name = ''
+        try: image = mod['Socket_4']
+        except Exception: image = None
+        if not uv_name or uv_name not in obj.data.uv_layers:
+            self.report({'ERROR'}, 'UV Map not set in modifier'); return {'CANCELLED'}
+        if image is None:
+            self.report({'ERROR'}, 'Base Texture not set in modifier'); return {'CANCELLED'}
+        if image.size[0] == 0 or image.size[1] == 0:
+            self.report({'ERROR'}, 'Image has zero size'); return {'CANCELLED'}
+
+        self._gen = self._work(context, obj, image, uv_name)
+        self._spin_idx = 0
+        self._last_text = ''
+        # advance once so the first status is visible immediately
+        try:
+            first = next(self._gen)
+            self._apply_status(context, first)
+        except StopIteration:
+            self._cleanup(context)
+            return {'FINISHED'}
+        except Exception as e:
+            self._cleanup(context)
+            self.report({'ERROR'}, f'{type(e).__name__}: {e}')
+            return {'CANCELLED'}
+        wm = context.window_manager
+        wm.progress_begin(0, 100)
+        self._timer = wm.event_timer_add(0.08, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            print('[AutoPalette] cancelled by ESC', flush=True)
+            self._cleanup(context)
+            self.report({'WARNING'}, 'Auto Palette Split cancelled')
+            return {'CANCELLED'}
+        if event.type == 'TIMER':
+            try:
+                status = next(self._gen)
+                self._apply_status(context, status)
+            except StopIteration:
+                self._cleanup(context)
+                return {'FINISHED'}
+            except Exception as e:
+                print(f'[AutoPalette] FAILED: {type(e).__name__}: {e}', flush=True)
+                self._cleanup(context)
+                self.report({'ERROR'}, f'{type(e).__name__}: {e}')
+                return {'CANCELLED'}
+        return {'PASS_THROUGH'}
+
+    def _apply_status(self, context, status):
+        if isinstance(status, tuple):
+            text, pct = status
+        else:
+            text, pct = status, None
+        self._spin_idx = (self._spin_idx + 1) % len(self._SPIN)
+        spin = self._SPIN[self._spin_idx]
+        full = f'{spin}  EBC Auto Palette: {text}   (ESC to cancel)'
+        try:
+            if context.workspace:
+                context.workspace.status_text_set(full)
+        except Exception:
+            pass
+        if pct is not None:
+            try: context.window_manager.progress_update(max(0, min(100, int(pct))))
+            except Exception: pass
+        self._last_text = text
+
+    def _cleanup(self, context):
+        wm = context.window_manager
+        if getattr(self, '_timer', None) is not None:
+            try: wm.event_timer_remove(self._timer)
+            except Exception: pass
+            self._timer = None
+        try: wm.progress_end()
+        except Exception: pass
+        try:
+            if context.workspace:
+                context.workspace.status_text_set(None)
+        except Exception:
+            pass
+
+    def _work(self, context, obj, image, uv_name):
+        """Generator: yields ('text', pct 0..100) or just 'text'. Each yield = UI tick."""
+        import math, colorsys, time
+        import numpy as np
+
         def log(msg):
             print(f'[AutoPalette] {msg}', flush=True)
 
         t_start = time.time()
-        def t_since():
-            return f'{time.time() - t_start:.1f}s'
-
         log(f'=== Auto Palette Split started: K={self.num_clusters}, samples={self.samples_per_face}, HSV={self.use_hsv} ===')
-        obj = context.view_layer.objects.active
-        if obj is None or obj.type != 'MESH':
-            self.report({'ERROR'}, 'No active mesh')
-            return {'CANCELLED'}
-
-        mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN')
-        if mod is None:
-            self.report({'ERROR'}, 'Add Edit By Colour modifier first')
-            return {'CANCELLED'}
-
-        try:
-            uv_name = mod['Socket_2']
-        except Exception:
-            uv_name = ''
-        try:
-            image = mod['Socket_4']
-        except Exception:
-            image = None
-
-        if not uv_name or uv_name not in obj.data.uv_layers:
-            self.report({'ERROR'}, 'UV Map not set in modifier')
-            return {'CANCELLED'}
-        if image is None:
-            self.report({'ERROR'}, 'Base Texture not set in modifier')
-            return {'CANCELLED'}
 
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
         w, h = image.size[0], image.size[1]
-        if w == 0 or h == 0:
-            self.report({'ERROR'}, 'Image has zero size')
-            return {'CANCELLED'}
-
-        # Read image pixels into numpy once
-        log(f'Reading image pixels: {w}x{h} ({w*h/1e6:.2f}M px)...')
+        yield (f'Reading image {w}x{h}...', 0)
         npx = np.empty(len(image.pixels), dtype=np.float32)
         image.pixels.foreach_get(npx)
         img = npx.reshape(h, w, 4)[:, :, :3]
-        log(f'Image read in {t_since()}')
+        log(f'Image read in {time.time() - t_start:.1f}s')
 
-        # Barycentric sample points
         n = max(1, self.samples_per_face)
         bary_pts = []
         k = int(math.ceil(math.sqrt(n)))
         for i in range(1, k + 2):
             for j in range(1, k - i + 3):
-                a = i / (k + 2)
-                b = j / (k + 2)
-                c = 1.0 - a - b
+                a = i / (k + 2); b = j / (k + 2); c = 1.0 - a - b
                 if c > 0:
                     bary_pts.append((a, b, c))
         if not bary_pts:
             bary_pts = [(1/3, 1/3, 1/3)]
         if len(bary_pts) > n:
             bary_pts = bary_pts[:n]
-        bary = np.array(bary_pts, dtype=np.float32)  # (S, 3)
+        bary = np.array(bary_pts, dtype=np.float32)
 
         me = obj.data
         uv_layer = me.uv_layers[uv_name].data
         n_polys = len(me.polygons)
         if n_polys == 0:
-            self.report({'ERROR'}, 'Mesh has no polygons')
-            return {'CANCELLED'}
+            raise RuntimeError('Mesh has no polygons')
 
-        # Per-face average color
         face_colors = np.zeros((n_polys, 3), dtype=np.float32)
-        log(f'Sampling {n_polys} polygons (this is the slow part)...')
+        log(f'Sampling {n_polys} polygons...')
         t_sample = time.time()
-        progress_step = max(1, n_polys // 20)
+        # Chunk size for UI yield frequency
+        sample_chunk = max(20000, n_polys // 40)
+        for chunk_start in range(0, n_polys, sample_chunk):
+            chunk_end = min(chunk_start + sample_chunk, n_polys)
+            for pi in range(chunk_start, chunk_end):
+                poly = me.polygons[pi]
+                li = poly.loop_indices
+                ln = poly.loop_total
+                if ln < 3:
+                    continue
+                uv0 = uv_layer[li[0]].uv
+                acc_r = acc_g = acc_b = 0.0
+                cnt = 0
+                for ti in range(1, ln - 1):
+                    uv1 = uv_layer[li[ti]].uv
+                    uv2 = uv_layer[li[ti + 1]].uv
+                    us = bary[:, 0] * uv0[0] + bary[:, 1] * uv1[0] + bary[:, 2] * uv2[0]
+                    vs = bary[:, 0] * uv0[1] + bary[:, 1] * uv1[1] + bary[:, 2] * uv2[1]
+                    us = us - np.floor(us)
+                    vs = vs - np.floor(vs)
+                    xs = np.minimum((us * w).astype(np.int32), w - 1)
+                    ys = np.minimum((vs * h).astype(np.int32), h - 1)
+                    cols = img[ys, xs]
+                    acc_r += float(cols[:, 0].sum())
+                    acc_g += float(cols[:, 1].sum())
+                    acc_b += float(cols[:, 2].sum())
+                    cnt += len(bary)
+                if cnt > 0:
+                    face_colors[pi, 0] = acc_r / cnt
+                    face_colors[pi, 1] = acc_g / cnt
+                    face_colors[pi, 2] = acc_b / cnt
+            pct = chunk_end * 100 // n_polys
+            elapsed = time.time() - t_sample
+            eta = elapsed * (n_polys - chunk_end) / max(chunk_end, 1)
+            log(f'  sampling {pct}% ({chunk_end}/{n_polys}) elapsed {elapsed:.1f}s ETA {eta:.1f}s')
+            # Pct range for this stage: 0..40
+            yield (f'Sampling polygons {pct}% (ETA {eta:.0f}s)', int(pct * 0.4))
+        log(f'Sampling done in {time.time() - t_sample:.1f}s')
 
-        # Process polys — for tri/quad fast path, fallback fan
-        for pi, poly in enumerate(me.polygons):
-            if pi and pi % progress_step == 0:
-                pct = pi * 100 // n_polys
-                elapsed = time.time() - t_sample
-                eta = elapsed * (n_polys - pi) / pi
-                log(f'  sampling {pct}% ({pi}/{n_polys}) elapsed {elapsed:.1f}s ETA {eta:.1f}s')
-            li = poly.loop_indices
-            ln = poly.loop_total
-            if ln < 3:
-                continue
-            uv0 = uv_layer[li[0]].uv
-            acc_r = acc_g = acc_b = 0.0
-            cnt = 0
-            for ti in range(1, ln - 1):
-                uv1 = uv_layer[li[ti]].uv
-                uv2 = uv_layer[li[ti + 1]].uv
-                us = bary[:, 0] * uv0[0] + bary[:, 1] * uv1[0] + bary[:, 2] * uv2[0]
-                vs = bary[:, 0] * uv0[1] + bary[:, 1] * uv1[1] + bary[:, 2] * uv2[1]
-                us = us - np.floor(us)
-                vs = vs - np.floor(vs)
-                xs = np.minimum((us * w).astype(np.int32), w - 1)
-                ys = np.minimum((vs * h).astype(np.int32), h - 1)
-                cols = img[ys, xs]
-                acc_r += float(cols[:, 0].sum())
-                acc_g += float(cols[:, 1].sum())
-                acc_b += float(cols[:, 2].sum())
-                cnt += len(bary)
-            if cnt > 0:
-                face_colors[pi, 0] = acc_r / cnt
-                face_colors[pi, 1] = acc_g / cnt
-                face_colors[pi, 2] = acc_b / cnt
-
-        # Convert to clustering space
         def rgb_to_hsv_np(arr):
             r, g, b = arr[:, 0], arr[:, 1], arr[:, 2]
-            mx = np.max(arr, axis=1)
-            mn = np.min(arr, axis=1)
+            mx = np.max(arr, axis=1); mn = np.min(arr, axis=1)
             d = mx - mn
             s = np.where(mx > 0, d / np.maximum(mx, 1e-8), 0.0)
             rc = np.where(d > 0, (mx - r) / np.maximum(d, 1e-8), 0.0)
@@ -3039,17 +3101,15 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             h_ = (h_ / 6.0) % 1.0
             return np.stack([h_, s, mx], axis=1)
 
-        log(f'Sampling done in {time.time() - t_sample:.1f}s. Preparing cluster space...')
+        yield ('Preparing cluster space...', 42)
         if self.use_hsv:
             cluster_data = rgb_to_hsv_np(face_colors)
-            # Weight: hue cyclic distance handled via cos/sin to keep euclidean kmeans valid
             hx = np.cos(cluster_data[:, 0] * 2.0 * math.pi) * cluster_data[:, 1]
             hy = np.sin(cluster_data[:, 0] * 2.0 * math.pi) * cluster_data[:, 1]
             cluster_data = np.stack([hx, hy, cluster_data[:, 2]], axis=1)
         else:
             cluster_data = face_colors
 
-        # Subsample for k-means
         N = cluster_data.shape[0]
         cap = min(N, max(self.num_clusters * 50, self.kmeans_subsample))
         if N > cap:
@@ -3060,8 +3120,8 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
 
         K = self.num_clusters
         log(f'K-means++ init for K={K} on {sample.shape[0]} samples...')
+        yield (f'K-means init K={K}...', 44)
         t_km = time.time()
-        # k-means++ init
         rng = np.random.default_rng(42)
         first = rng.integers(0, sample.shape[0])
         centers = [sample[first]]
@@ -3075,29 +3135,27 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             centers.append(sample[nxt])
         centers = np.stack(centers, axis=0)
 
-        # Lloyd iterations
         for it in range(self.kmeans_iters):
             d2 = np.sum((sample[:, None, :] - centers[None, :, :]) ** 2, axis=2)
             labels = np.argmin(d2, axis=1)
             new_centers = np.zeros_like(centers)
-            counts = np.zeros(K, dtype=np.int32)
             for c in range(K):
                 mask = labels == c
                 if mask.any():
                     new_centers[c] = sample[mask].mean(axis=0)
-                    counts[c] = int(mask.sum())
                 else:
                     new_centers[c] = centers[c]
-            shift = np.linalg.norm(new_centers - centers)
+            shift = float(np.linalg.norm(new_centers - centers))
             centers = new_centers
             log(f'  iter {it+1}/{self.kmeans_iters}: shift={shift:.5f}')
+            pct = 44 + int(6 * (it + 1) / self.kmeans_iters)
+            yield (f'K-means iter {it+1}/{self.kmeans_iters} (shift={shift:.4f})', pct)
             if shift < 1e-5:
                 log(f'  converged early at iter {it+1}')
                 break
         log(f'K-means done in {time.time() - t_km:.1f}s')
 
-        # Assign all faces to nearest center (chunked to avoid OOM on big meshes)
-        log(f'Assigning {cluster_data.shape[0]} faces to nearest cluster (chunked)...')
+        log(f'Assigning {cluster_data.shape[0]} faces to nearest cluster...')
         t_assign = time.time()
         face_labels = np.empty(cluster_data.shape[0], dtype=np.int32)
         chunk = 50000
@@ -3107,20 +3165,17 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             seg = cluster_data[start:end]
             d2_seg = np.sum((seg[:, None, :] - centers[None, :, :]) ** 2, axis=2)
             face_labels[start:end] = np.argmin(d2_seg, axis=1)
-            if ci % 5 == 0 or ci == total_chunks - 1:
-                log(f'  chunk {ci+1}/{total_chunks}')
+            pct = 50 + int(10 * (ci + 1) / total_chunks)
+            yield (f'Assigning faces {ci+1}/{total_chunks}', pct)
         log(f'Assignment done in {time.time() - t_assign:.1f}s')
 
-        # Compute representative RGB color per cluster from face_colors
         cluster_rgb = np.zeros((K, 3), dtype=np.float32)
         for c in range(K):
             mask = face_labels == c
             if mask.any():
                 cluster_rgb[c] = face_colors[mask].mean(axis=0)
 
-        # Create materials and assign
-        log('Creating materials...')
-        t_mat = time.time()
+        yield ('Creating materials...', 62)
         slot_map = {}
         for c in range(K):
             if not (face_labels == c).any():
@@ -3133,55 +3188,55 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
                 mat.use_nodes = True
                 for nd in mat.node_tree.nodes:
                     if nd.type == 'BSDF_PRINCIPLED':
-                        nd.inputs['Base Color'].default_value = (r, g, b, 1.0)
-                        break
+                        nd.inputs['Base Color'].default_value = (r, g, b, 1.0); break
             mat.diffuse_color = (r, g, b, 1.0)
             slot_idx = -1
             for si, s in enumerate(obj.material_slots):
                 if s.material and s.material.name == mat.name:
-                    slot_idx = si
-                    break
+                    slot_idx = si; break
             if slot_idx < 0:
                 obj.data.materials.append(mat)
                 slot_idx = len(obj.material_slots) - 1
             slot_map[c] = slot_idx
+        log(f'Materials: {len(slot_map)} non-empty buckets')
 
-        log(f'Materials done in {time.time() - t_mat:.1f}s ({len(slot_map)} non-empty buckets)')
         log('Writing material_index per polygon...')
         t_w = time.time()
-        for pi, poly in enumerate(me.polygons):
-            c = int(face_labels[pi])
-            if c in slot_map:
-                poly.material_index = slot_map[c]
+        # foreach_set is much faster than Python loop
+        slot_arr = np.zeros(n_polys, dtype=np.int32)
+        slot_lookup = np.full(K, -1, dtype=np.int32)
+        for c, si in slot_map.items():
+            slot_lookup[c] = si
+        slot_arr = slot_lookup[face_labels]
+        # any -1 entries (shouldn't happen) → 0
+        slot_arr[slot_arr < 0] = 0
+        obj.data.polygons.foreach_set('material_index', slot_arr)
+        obj.data.update()
         log(f'Material indices written in {time.time() - t_w:.1f}s')
-
-        me.update()
+        yield ('Material indices written', 70)
 
         if self.remove_modifier:
             try:
                 obj.modifiers.remove(obj.modifiers['KIRI_Edit_By_Colour_GN'])
-                log('Removed KIRI_Edit_By_Colour_GN modifier from source object')
+                log('Removed KIRI_Edit_By_Colour_GN modifier')
             except Exception as e:
                 log(f'Could not remove modifier: {e}')
+            yield ('Modifier removed', 72)
 
         if self.do_separate and self.progressive_separate:
-            log('Progressive separate: one material at a time (via material_slot_select)...')
+            log('Progressive separate via material_slot_select...')
             t_sep = time.time()
             unique_labels = sorted(set(int(x) for x in face_labels) & set(slot_map.keys()))
             to_split = unique_labels[:-1]
             total = len(to_split)
-            log(f'  {total} separate calls planned (1 cluster stays on source)')
-            source_obj = obj
-            source_name = obj.name
+            log(f'  {total} separate calls planned')
             bpy.ops.object.mode_set(mode='OBJECT')
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
             context.view_layer.objects.active = obj
-            # Enter Edit mode once and stay there for all iterations
             bpy.ops.object.mode_set(mode='EDIT')
             bpy.ops.mesh.select_mode(type='FACE')
             for ki, c in enumerate(to_split):
-                log(f'  >> iter {ki+1}/{total} cluster={c}')
                 try:
                     active = context.view_layer.objects.active
                     if active is None:
@@ -3193,29 +3248,20 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
                     objs_before = set(bpy.data.objects)
                     bpy.ops.mesh.separate(type='SELECTED')
                     new_objs = set(bpy.data.objects) - objs_before
-                    n_new_polys = 0
-                    for o in new_objs:
-                        try: n_new_polys += len(o.data.polygons)
-                        except Exception: pass
-                    if ki < 3:
-                        for o in new_objs:
-                            try: pc = len(o.data.polygons)
-                            except Exception: pc = '?'
-                            log(f'    new: {o.name} polys={pc}')
-                    if n_new_polys == 0:
-                        log(f'  cluster {c} (mi={target_mi}) produced 0 faces, skip')
-                        continue
+                    n_new = sum(len(o.data.polygons) for o in new_objs)
                     elapsed = time.time() - t_sep
                     eta = elapsed * (total - (ki + 1)) / max(ki + 1, 1)
-                    log(f'  separated {ki+1}/{total} (cluster {c}, mi={target_mi}, {n_new_polys} faces) elapsed {elapsed:.1f}s ETA {eta:.1f}s')
+                    log(f'  separated {ki+1}/{total} (cluster {c}, {n_new} faces) elapsed {elapsed:.1f}s ETA {eta:.1f}s')
+                    pct = 72 + int(26 * (ki + 1) / total)
+                    yield (f'Separating {ki+1}/{total} (ETA {eta:.0f}s)', pct)
                 except Exception as e:
-                    log(f'  ERROR on iter {ki+1} cluster {c}: {type(e).__name__}: {e}')
+                    log(f'  ERROR iter {ki+1}: {type(e).__name__}: {e}')
             try: bpy.ops.object.mode_set(mode='OBJECT')
             except Exception: pass
             log(f'Progressive separation done in {time.time() - t_sep:.1f}s')
-
         elif self.do_separate:
-            log('Separating by material (single blocking op, no progress)...')
+            log('Separating by material (atomic)...')
+            yield ('Separating by material (atomic, no progress)', 75)
             t_sep = time.time()
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
@@ -3225,16 +3271,13 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             try:
                 bpy.ops.mesh.separate(type='MATERIAL')
             except RuntimeError as e:
-                self.report({'WARNING'}, f'Separate failed: {e}')
+                log(f'Separate failed: {e}')
             bpy.ops.object.mode_set(mode='OBJECT')
             log(f'Separation done in {time.time() - t_sep:.1f}s')
 
-        log(f'=== DONE in {t_since()} — {len(slot_map)} non-empty clusters of {K} ===')
+        log(f'=== DONE in {time.time() - t_start:.1f}s — {len(slot_map)} non-empty clusters of {K} ===')
+        yield (f'Done — {len(slot_map)} clusters', 100)
         self.report({'INFO'}, f'Auto split: {len(slot_map)} non-empty clusters of {K}')
-        return {'FINISHED'}
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=380)
 
     def draw(self, context):
         layout = self.layout
@@ -3376,9 +3419,6 @@ def sna_auto_palette_interface(layout_function):
     box.operator('sna.remove_ebc_modifier_from_selected',
                  text='Remove EBC Modifier from Selected',
                  icon_value=string_to_icon('TRASH'))
-    box.operator('sna.test_progressive_separate',
-                 text='Self-Test: Progressive Separate',
-                 icon_value=string_to_icon('EXPERIMENTAL'))
 
 
 def sna_palette_split_interface(layout_function):
