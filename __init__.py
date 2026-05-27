@@ -2998,7 +2998,12 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
 
     def _apply_status(self, context, status):
         if isinstance(status, tuple):
-            text, pct = status
+            if len(status) >= 2:
+                text, pct = status[0], status[1]
+            elif len(status) == 1:
+                text, pct = status[0], None
+            else:
+                text, pct = str(status), None
         else:
             text, pct = status, None
         self._spin_idx = (self._spin_idx + 1) % len(self._SPIN)
@@ -3340,7 +3345,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             s = int(poly_loop_start[pi]); t = int(poly_loop_total[pi])
             poly_of_loop[s:s + t] = pi
         log(f'  adjacency arrays built in {time.time() - t0:.1f}s')
-        yield ('Merging islands: sorting edges...',)
+        yield ('Merging islands: sorting edges...', 61)
 
         # Pair faces sharing the same edge
         sort_idx = np.argsort(loop_edge, kind='stable')
@@ -3350,7 +3355,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         pair_a = sorted_polys[:-1][same_edge]
         pair_b = sorted_polys[1:][same_edge]
         log(f'  {len(pair_a)} adjacent face pairs')
-        yield ('Merging islands: union-find...',)
+        yield ('Merging islands: union-find...', 62)
 
         # Union-find within same cluster label
         parent = np.arange(n_polys, dtype=np.int32)
@@ -3377,7 +3382,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         for i in range(n_polys):
             find(i)
         log(f'  union-find done in {time.time() - t0:.1f}s')
-        yield ('Merging islands: component stats...',)
+        yield ('Merging islands: component stats...', 63)
 
         # Component face lists + bboxes + face counts
         v_co = np.empty(n_verts * 3, dtype=np.float32)
@@ -3410,7 +3415,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             vs = v_world[uniq]
             comp_bbox[root] = (vs.min(axis=0), vs.max(axis=0))
 
-        yield ('Merging islands: finding small ones...',)
+        yield ('Merging islands: finding small ones...', 64)
         min_x = float(self.min_island_size_x)
         min_y = float(self.min_island_size_y)
         min_z = float(self.min_island_size_z)
@@ -3450,7 +3455,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             if rb in small_roots:
                 comp_neighbor_counts[rb][int(face_labels[ai])] += 1
 
-        yield ('Merging islands: reassigning faces...',)
+        yield ('Merging islands: reassigning faces...', 65)
         reassigned = 0
         for root in small_roots:
             nbrs = comp_neighbor_counts.get(root)
