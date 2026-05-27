@@ -3165,7 +3165,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
                 log(f'Could not remove modifier: {e}')
 
         if self.do_separate and self.progressive_separate:
-            log('Progressive separate: one material at a time...')
+            log('Progressive separate: one material at a time (via material_slot_select)...')
             t_sep = time.time()
             unique_labels = sorted(set(int(x) for x in face_labels) & set(slot_map.keys()))
             to_split = unique_labels[:-1]
@@ -3177,92 +3177,41 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
             context.view_layer.objects.active = obj
+            # Enter Edit mode once and stay there for all iterations
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_mode(type='FACE')
             for ki, c in enumerate(to_split):
                 log(f'  >> iter {ki+1}/{total} cluster={c}')
                 try:
-                    # 1) direct reference
-                    cur_obj = source_obj
-                    n_poly_now = -1
-                    try:
-                        n_poly_now = len(cur_obj.data.polygons)
-                    except (ReferenceError, AttributeError):
-                        cur_obj = None
-                    # 2) fallback by name
-                    if cur_obj is None or n_poly_now == 0:
-                        by_name = bpy.data.objects.get(source_name)
-                        if by_name is not None:
-                            try:
-                                n_by = len(by_name.data.polygons)
-                            except Exception:
-                                n_by = 0
-                            if n_by > 0:
-                                cur_obj = by_name
-                                n_poly_now = n_by
-                                source_obj = by_name
-                                log(f'  recovered source by name: {cur_obj.name} polys={n_poly_now}')
-                    # 3) last resort: largest mesh in scene
-                    if cur_obj is None or n_poly_now == 0:
-                        best = None
-                        best_n = 0
-                        for o in bpy.data.objects:
-                            if o.type != 'MESH':
-                                continue
-                            try: pc = len(o.data.polygons)
-                            except Exception: pc = 0
-                            if pc > best_n:
-                                best = o
-                                best_n = pc
-                        if best is not None and best_n > 0:
-                            cur_obj = best
-                            n_poly_now = best_n
-                            source_obj = best
-                            source_name = best.name
-                            log(f'  fallback to largest mesh: {cur_obj.name} polys={n_poly_now}')
-                    if cur_obj is None or n_poly_now == 0:
-                        log('  Cannot locate source. Mesh inventory:')
-                        for o in bpy.data.objects:
-                            if o.type == 'MESH':
-                                try: pc = len(o.data.polygons)
-                                except Exception: pc = '?'
-                                log(f'    {o.name}: polys={pc}')
-                        break
-                    # ensure object mode + only source selected/active
-                    if context.mode != 'OBJECT':
-                        bpy.ops.object.mode_set(mode='OBJECT')
-                    bpy.ops.object.select_all(action='DESELECT')
-                    cur_obj.select_set(True)
-                    context.view_layer.objects.active = cur_obj
+                    active = context.view_layer.objects.active
+                    if active is None:
+                        log('  no active object — stopping'); break
                     target_mi = slot_map[c]
-                    mi_arr = np.empty(n_poly_now, dtype=np.int32)
-                    cur_obj.data.polygons.foreach_get('material_index', mi_arr)
-                    sel_arr = (mi_arr == target_mi)
-                    sel_count = int(sel_arr.sum())
-                    if sel_count == 0:
-                        log(f'  cluster {c} (mi={target_mi}) not in source, skip')
-                        continue
-                    cur_obj.data.polygons.foreach_set('select', sel_arr.astype(np.int32))
-                    cur_obj.data.update()
+                    active.active_material_index = target_mi
+                    bpy.ops.mesh.select_all(action='DESELECT')
+                    bpy.ops.object.material_slot_select()
                     objs_before = set(bpy.data.objects)
-                    bpy.ops.object.mode_set(mode='EDIT')
                     bpy.ops.mesh.separate(type='SELECTED')
-                    bpy.ops.object.mode_set(mode='OBJECT')
                     new_objs = set(bpy.data.objects) - objs_before
-                    # Diagnostic for first 3 iters
+                    n_new_polys = 0
+                    for o in new_objs:
+                        try: n_new_polys += len(o.data.polygons)
+                        except Exception: pass
                     if ki < 3:
                         for o in new_objs:
                             try: pc = len(o.data.polygons)
                             except Exception: pc = '?'
                             log(f'    new: {o.name} polys={pc}')
-                        try: src_polys = len(cur_obj.data.polygons)
-                        except Exception: src_polys = '?'
-                        log(f'    source after: {cur_obj.name} polys={src_polys}')
+                    if n_new_polys == 0:
+                        log(f'  cluster {c} (mi={target_mi}) produced 0 faces, skip')
+                        continue
                     elapsed = time.time() - t_sep
                     eta = elapsed * (total - (ki + 1)) / max(ki + 1, 1)
-                    log(f'  separated {ki+1}/{total} (cluster {c}, {sel_count} faces) elapsed {elapsed:.1f}s ETA {eta:.1f}s')
+                    log(f'  separated {ki+1}/{total} (cluster {c}, mi={target_mi}, {n_new_polys} faces) elapsed {elapsed:.1f}s ETA {eta:.1f}s')
                 except Exception as e:
                     log(f'  ERROR on iter {ki+1} cluster {c}: {type(e).__name__}: {e}')
-                    try: bpy.ops.object.mode_set(mode='OBJECT')
-                    except Exception: pass
+            try: bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception: pass
             log(f'Progressive separation done in {time.time() - t_sep:.1f}s')
 
         elif self.do_separate:
@@ -3342,54 +3291,37 @@ class SNA_OT_test_progressive_separate(bpy.types.Operator):
         counts = [int((mi == k).sum()) for k in range(4)]
         p(f'mat counts: {counts}')
 
-        source_obj = plane
-        source_name = plane.name
         ok = True
+        bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.select_all(action='DESELECT')
+        plane.select_set(True)
+        context.view_layer.objects.active = plane
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='FACE')
         for target_mi in range(3):  # last stays on source
             p(f'--- iter mi={target_mi} ---')
-            # direct ref check
             try:
-                n_ref = len(source_obj.data.polygons)
-                p(f'  ref: name={source_obj.name} polys={n_ref}')
+                active = context.view_layer.objects.active
+                p(f'  active before: {active.name if active else None}')
+                active.active_material_index = target_mi
+                bpy.ops.mesh.select_all(action='DESELECT')
+                bpy.ops.object.material_slot_select()
+                before = set(bpy.data.objects)
+                bpy.ops.mesh.separate(type='SELECTED')
+                new = list(set(bpy.data.objects) - before)
+                for o in new:
+                    p(f'  new: {o.name} polys={len(o.data.polygons)}')
+                active_after = context.view_layer.objects.active
+                if active_after is not None:
+                    try: pc = len(active_after.data.polygons)
+                    except Exception: pc = '?'
+                    p(f'  active after: {active_after.name} polys={pc}')
             except Exception as e:
-                p(f'  ref invalid: {e}')
-                n_ref = -1
-
-            by_name = bpy.data.objects.get(source_name)
-            n_name = len(by_name.data.polygons) if by_name else -1
-            p(f'  by_name "{source_name}": polys={n_name} (same as ref? {by_name is source_obj})')
-
-            cur = source_obj if n_ref > 0 else by_name
-            if cur is None or len(cur.data.polygons) == 0:
-                p('  source LOST'); ok = False; break
-
-            bpy.ops.object.mode_set(mode='OBJECT')
-            bpy.ops.object.select_all(action='DESELECT')
-            cur.select_set(True)
-            context.view_layer.objects.active = cur
-            n_now = len(cur.data.polygons)
-            mi_arr = np.empty(n_now, dtype=np.int32)
-            cur.data.polygons.foreach_get('material_index', mi_arr)
-            sel = (mi_arr == target_mi).astype(np.int32)
-            sc = int(sel.sum())
-            p(f'  selecting {sc} of {n_now} polys')
-            cur.data.polygons.foreach_set('select', sel)
-            cur.data.update()
-
-            before = set(bpy.data.objects)
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.separate(type='SELECTED')
-            bpy.ops.object.mode_set(mode='OBJECT')
-            new = list(set(bpy.data.objects) - before)
-            for o in new:
-                p(f'  new: {o.name} polys={len(o.data.polygons)}')
-            try:
-                src_after = len(source_obj.data.polygons)
-                p(f'  source_obj after: name={source_obj.name} polys={src_after}')
-            except Exception as e:
-                p(f'  source_obj after: invalid ref ({e})')
-            by_name2 = bpy.data.objects.get(source_name)
-            p(f'  by_name "{source_name}" after: polys={len(by_name2.data.polygons) if by_name2 else "GONE"}')
+                p(f'  ERROR: {type(e).__name__}: {e}')
+                ok = False
+                break
+        try: bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception: pass
 
         # final
         test_objs = [o for o in bpy.data.objects if o.name.startswith('_ebc_test_plane')]
