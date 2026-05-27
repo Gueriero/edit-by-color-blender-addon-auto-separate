@@ -3171,6 +3171,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             to_split = unique_labels[:-1]
             total = len(to_split)
             log(f'  {total} separate calls planned (1 cluster stays on source)')
+            source_obj = obj
             source_name = obj.name
             bpy.ops.object.mode_set(mode='OBJECT')
             bpy.ops.object.select_all(action='DESELECT')
@@ -3179,9 +3180,52 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             for ki, c in enumerate(to_split):
                 log(f'  >> iter {ki+1}/{total} cluster={c}')
                 try:
-                    cur_obj = bpy.data.objects.get(source_name)
-                    if cur_obj is None:
-                        log(f'  source "{source_name}" lost — stopping'); break
+                    # 1) direct reference
+                    cur_obj = source_obj
+                    n_poly_now = -1
+                    try:
+                        n_poly_now = len(cur_obj.data.polygons)
+                    except (ReferenceError, AttributeError):
+                        cur_obj = None
+                    # 2) fallback by name
+                    if cur_obj is None or n_poly_now == 0:
+                        by_name = bpy.data.objects.get(source_name)
+                        if by_name is not None:
+                            try:
+                                n_by = len(by_name.data.polygons)
+                            except Exception:
+                                n_by = 0
+                            if n_by > 0:
+                                cur_obj = by_name
+                                n_poly_now = n_by
+                                source_obj = by_name
+                                log(f'  recovered source by name: {cur_obj.name} polys={n_poly_now}')
+                    # 3) last resort: largest mesh in scene
+                    if cur_obj is None or n_poly_now == 0:
+                        best = None
+                        best_n = 0
+                        for o in bpy.data.objects:
+                            if o.type != 'MESH':
+                                continue
+                            try: pc = len(o.data.polygons)
+                            except Exception: pc = 0
+                            if pc > best_n:
+                                best = o
+                                best_n = pc
+                        if best is not None and best_n > 0:
+                            cur_obj = best
+                            n_poly_now = best_n
+                            source_obj = best
+                            source_name = best.name
+                            log(f'  fallback to largest mesh: {cur_obj.name} polys={n_poly_now}')
+                    if cur_obj is None or n_poly_now == 0:
+                        log('  Cannot locate source. Mesh inventory:')
+                        for o in bpy.data.objects:
+                            if o.type == 'MESH':
+                                try: pc = len(o.data.polygons)
+                                except Exception: pc = '?'
+                                log(f'    {o.name}: polys={pc}')
+                        break
                     # ensure object mode + only source selected/active
                     if context.mode != 'OBJECT':
                         bpy.ops.object.mode_set(mode='OBJECT')
@@ -3189,28 +3233,34 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
                     cur_obj.select_set(True)
                     context.view_layer.objects.active = cur_obj
                     target_mi = slot_map[c]
-                    # fast batched select via foreach_set
-                    n_poly_now = len(cur_obj.data.polygons)
-                    if n_poly_now == 0:
-                        log(f'  source has 0 polys, stopping'); break
                     mi_arr = np.empty(n_poly_now, dtype=np.int32)
                     cur_obj.data.polygons.foreach_get('material_index', mi_arr)
                     sel_arr = (mi_arr == target_mi)
                     sel_count = int(sel_arr.sum())
                     if sel_count == 0:
-                        log(f'  cluster {c} not found in source, skip')
+                        log(f'  cluster {c} (mi={target_mi}) not in source, skip')
                         continue
                     cur_obj.data.polygons.foreach_set('select', sel_arr.astype(np.int32))
                     cur_obj.data.update()
+                    objs_before = set(bpy.data.objects)
                     bpy.ops.object.mode_set(mode='EDIT')
                     bpy.ops.mesh.separate(type='SELECTED')
                     bpy.ops.object.mode_set(mode='OBJECT')
+                    new_objs = set(bpy.data.objects) - objs_before
+                    # Diagnostic for first 3 iters
+                    if ki < 3:
+                        for o in new_objs:
+                            try: pc = len(o.data.polygons)
+                            except Exception: pc = '?'
+                            log(f'    new: {o.name} polys={pc}')
+                        try: src_polys = len(cur_obj.data.polygons)
+                        except Exception: src_polys = '?'
+                        log(f'    source after: {cur_obj.name} polys={src_polys}')
                     elapsed = time.time() - t_sep
                     eta = elapsed * (total - (ki + 1)) / max(ki + 1, 1)
                     log(f'  separated {ki+1}/{total} (cluster {c}, {sel_count} faces) elapsed {elapsed:.1f}s ETA {eta:.1f}s')
                 except Exception as e:
                     log(f'  ERROR on iter {ki+1} cluster {c}: {type(e).__name__}: {e}')
-                    # ensure we're back in object mode for next iter
                     try: bpy.ops.object.mode_set(mode='OBJECT')
                     except Exception: pass
             log(f'Progressive separation done in {time.time() - t_sep:.1f}s')
@@ -3251,6 +3301,117 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         col.prop(self, 'kmeans_subsample')
 
 
+class SNA_OT_test_progressive_separate(bpy.types.Operator):
+    bl_idname = 'sna.test_progressive_separate'
+    bl_label = 'Self-Test: Progressive Separate'
+    bl_description = 'Builds a synthetic plane with 4 materials, runs the same loop logic, and reports pass/fail in the console'
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            import numpy as np
+        except Exception:
+            self.report({'ERROR'}, 'numpy not available')
+            return {'CANCELLED'}
+
+        def p(msg):
+            print(f'[TestSep] {msg}', flush=True)
+
+        p('=== test start ===')
+        # Build subdivided plane
+        bpy.ops.object.select_all(action='DESELECT')
+        bpy.ops.mesh.primitive_plane_add(location=(100, 100, 100))
+        plane = context.active_object
+        plane.name = '_ebc_test_plane'
+        p(f'created {plane.name}')
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.subdivide(number_cuts=10)
+        bpy.ops.object.mode_set(mode='OBJECT')
+        n = len(plane.data.polygons)
+        p(f'subdivided to {n} polys')
+
+        # 4 materials
+        mats = []
+        for i in range(4):
+            m = bpy.data.materials.new(f'_ebc_test_mat_{i}')
+            plane.data.materials.append(m)
+            mats.append(m)
+        mi = np.array([i % 4 for i in range(n)], dtype=np.int32)
+        plane.data.polygons.foreach_set('material_index', mi)
+        plane.data.update()
+        counts = [int((mi == k).sum()) for k in range(4)]
+        p(f'mat counts: {counts}')
+
+        source_obj = plane
+        source_name = plane.name
+        ok = True
+        for target_mi in range(3):  # last stays on source
+            p(f'--- iter mi={target_mi} ---')
+            # direct ref check
+            try:
+                n_ref = len(source_obj.data.polygons)
+                p(f'  ref: name={source_obj.name} polys={n_ref}')
+            except Exception as e:
+                p(f'  ref invalid: {e}')
+                n_ref = -1
+
+            by_name = bpy.data.objects.get(source_name)
+            n_name = len(by_name.data.polygons) if by_name else -1
+            p(f'  by_name "{source_name}": polys={n_name} (same as ref? {by_name is source_obj})')
+
+            cur = source_obj if n_ref > 0 else by_name
+            if cur is None or len(cur.data.polygons) == 0:
+                p('  source LOST'); ok = False; break
+
+            bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.ops.object.select_all(action='DESELECT')
+            cur.select_set(True)
+            context.view_layer.objects.active = cur
+            n_now = len(cur.data.polygons)
+            mi_arr = np.empty(n_now, dtype=np.int32)
+            cur.data.polygons.foreach_get('material_index', mi_arr)
+            sel = (mi_arr == target_mi).astype(np.int32)
+            sc = int(sel.sum())
+            p(f'  selecting {sc} of {n_now} polys')
+            cur.data.polygons.foreach_set('select', sel)
+            cur.data.update()
+
+            before = set(bpy.data.objects)
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.separate(type='SELECTED')
+            bpy.ops.object.mode_set(mode='OBJECT')
+            new = list(set(bpy.data.objects) - before)
+            for o in new:
+                p(f'  new: {o.name} polys={len(o.data.polygons)}')
+            try:
+                src_after = len(source_obj.data.polygons)
+                p(f'  source_obj after: name={source_obj.name} polys={src_after}')
+            except Exception as e:
+                p(f'  source_obj after: invalid ref ({e})')
+            by_name2 = bpy.data.objects.get(source_name)
+            p(f'  by_name "{source_name}" after: polys={len(by_name2.data.polygons) if by_name2 else "GONE"}')
+
+        # final
+        test_objs = [o for o in bpy.data.objects if o.name.startswith('_ebc_test_plane')]
+        p(f'FINAL inventory: {len(test_objs)} test objects')
+        for o in test_objs:
+            p(f'  {o.name}: {len(o.data.polygons)} polys')
+        if len(test_objs) == 4 and ok:
+            p('=== PASS ===')
+            self.report({'INFO'}, 'TestSep PASS')
+        else:
+            p(f'=== FAIL: expected 4 objects, got {len(test_objs)} ===')
+            self.report({'ERROR'}, f'TestSep FAIL ({len(test_objs)} objects)')
+
+        # cleanup
+        for o in test_objs:
+            bpy.data.objects.remove(o, do_unlink=True)
+        for m in mats:
+            if m.users == 0:
+                bpy.data.materials.remove(m, do_unlink=True)
+        return {'FINISHED'}
+
+
 class SNA_OT_remove_ebc_modifier_from_selected(bpy.types.Operator):
     bl_idname = 'sna.remove_ebc_modifier_from_selected'
     bl_label = 'Remove EBC Modifier from Selected'
@@ -3283,6 +3444,9 @@ def sna_auto_palette_interface(layout_function):
     box.operator('sna.remove_ebc_modifier_from_selected',
                  text='Remove EBC Modifier from Selected',
                  icon_value=string_to_icon('TRASH'))
+    box.operator('sna.test_progressive_separate',
+                 text='Self-Test: Progressive Separate',
+                 icon_value=string_to_icon('EXPERIMENTAL'))
 
 
 def sna_palette_split_interface(layout_function):
@@ -3345,6 +3509,7 @@ def register():
     bpy.utils.register_class(SNA_OT_palette_split_and_colorize)
     bpy.utils.register_class(SNA_OT_auto_palette_split)
     bpy.utils.register_class(SNA_OT_remove_ebc_modifier_from_selected)
+    bpy.utils.register_class(SNA_OT_test_progressive_separate)
     bpy.types.Scene.sna_palette_colors = bpy.props.CollectionProperty(type=SNA_PaletteColorItem)
     bpy.types.Scene.sna_palette_active_index = bpy.props.IntProperty(default=0)
 
@@ -3391,6 +3556,7 @@ def unregister():
     bpy.utils.unregister_class(SNA_OT_Link_Baked_Textures_Patch_067F8)
     del bpy.types.Scene.sna_palette_active_index
     del bpy.types.Scene.sna_palette_colors
+    bpy.utils.unregister_class(SNA_OT_test_progressive_separate)
     bpy.utils.unregister_class(SNA_OT_remove_ebc_modifier_from_selected)
     bpy.utils.unregister_class(SNA_OT_auto_palette_split)
     bpy.utils.unregister_class(SNA_OT_palette_split_and_colorize)
