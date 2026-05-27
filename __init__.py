@@ -2907,9 +2907,19 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         name='Merge Small Islands', default=False,
         description='Find connected face regions per cluster; islands smaller than the threshold get merged into their majority neighbor cluster before separation. Reduces tiny print artifacts',
     )
-    min_island_size: bpy.props.FloatProperty(
-        name='Min Island Size', default=0.003, min=0.0, max=10.0,
-        description='Minimum bbox extent along X or Y for an island, in scene units (typically meters). Islands smaller than this are merged into neighbors',
+    min_island_size_x: bpy.props.FloatProperty(
+        name='Min X', default=0.003, min=0.0, max=10.0,
+        description='Minimum bbox extent along X for an island, in scene units. 0 disables the X check',
+        unit='LENGTH', precision=4,
+    )
+    min_island_size_y: bpy.props.FloatProperty(
+        name='Min Y', default=0.003, min=0.0, max=10.0,
+        description='Minimum bbox extent along Y for an island, in scene units. 0 disables the Y check',
+        unit='LENGTH', precision=4,
+    )
+    min_island_size_z: bpy.props.FloatProperty(
+        name='Min Z', default=0.0, min=0.0, max=10.0,
+        description='Minimum bbox extent along Z for an island, in scene units. 0 disables the Z check',
         unit='LENGTH', precision=4,
     )
     min_island_face_count: bpy.props.IntProperty(
@@ -3401,15 +3411,26 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             comp_bbox[root] = (vs.min(axis=0), vs.max(axis=0))
 
         yield ('Merging islands: finding small ones...',)
-        min_size = float(self.min_island_size)
+        min_x = float(self.min_island_size_x)
+        min_y = float(self.min_island_size_y)
+        min_z = float(self.min_island_size_z)
         min_faces = int(self.min_island_face_count)
         small_roots = set()
         for root, faces in comp_faces.items():
             n_f = len(faces)
             bmin, bmax = comp_bbox[root]
             extent = bmax - bmin
-            xy_min = float(min(extent[0], extent[1]))
-            if n_f < min_faces or (min_size > 0.0 and xy_min < min_size):
+            dx, dy, dz = float(extent[0]), float(extent[1]), float(extent[2])
+            too_small = False
+            if min_faces > 0 and n_f < min_faces:
+                too_small = True
+            if min_x > 0.0 and dx < min_x:
+                too_small = True
+            if min_y > 0.0 and dy < min_y:
+                too_small = True
+            if min_z > 0.0 and dz < min_z:
+                too_small = True
+            if too_small:
                 small_roots.add(root)
         log(f'  {len(small_roots)} small islands flagged for merging')
 
@@ -3454,7 +3475,10 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         layout.prop(self, 'merge_small_islands')
         sub = layout.column(align=True)
         sub.enabled = self.merge_small_islands
-        sub.prop(self, 'min_island_size')
+        sub.label(text='Min bbox per axis (0 = ignore axis):')
+        sub.prop(self, 'min_island_size_x')
+        sub.prop(self, 'min_island_size_y')
+        sub.prop(self, 'min_island_size_z')
         sub.prop(self, 'min_island_face_count')
         col = layout.column(align=True)
         col.label(text='Advanced:')
@@ -3601,7 +3625,9 @@ class SNA_OT_test_merge_islands(bpy.types.Operator):
         class _Stub:
             pass
         stub = _Stub()
-        stub.min_island_size = 0.015  # 15mm
+        stub.min_island_size_x = 0.015  # 15mm
+        stub.min_island_size_y = 0.015
+        stub.min_island_size_z = 0.0   # plane has no Z extent — disable
         stub.min_island_face_count = 0
 
         gen = SNA_OT_auto_palette_split._merge_islands_gen(stub, plane, face_labels, p)
