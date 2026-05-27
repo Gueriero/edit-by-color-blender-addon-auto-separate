@@ -3421,11 +3421,29 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         min_z = float(self.min_island_size_z)
         min_faces = int(self.min_island_face_count)
         small_roots = set()
+        # Histogram diagnostics
+        hist_faces = {'<5': 0, '5-20': 0, '20-100': 0, '100-1000': 0, '1000+': 0}
+        hist_xy = {'<1mm': 0, '1-3mm': 0, '3-10mm': 0, '10-50mm': 0, '50mm+': 0}
+        # Top-5 largest by face count (potential giant components)
+        largest = []
         for root, faces in comp_faces.items():
             n_f = len(faces)
             bmin, bmax = comp_bbox[root]
             extent = bmax - bmin
             dx, dy, dz = float(extent[0]), float(extent[1]), float(extent[2])
+            xy_min = min(dx, dy)
+            # Histogram
+            if n_f < 5: hist_faces['<5'] += 1
+            elif n_f < 20: hist_faces['5-20'] += 1
+            elif n_f < 100: hist_faces['20-100'] += 1
+            elif n_f < 1000: hist_faces['100-1000'] += 1
+            else: hist_faces['1000+'] += 1
+            if xy_min < 0.001: hist_xy['<1mm'] += 1
+            elif xy_min < 0.003: hist_xy['1-3mm'] += 1
+            elif xy_min < 0.010: hist_xy['3-10mm'] += 1
+            elif xy_min < 0.050: hist_xy['10-50mm'] += 1
+            else: hist_xy['50mm+'] += 1
+            largest.append((n_f, dx, dy, dz, root))
             too_small = False
             if min_faces > 0 and n_f < min_faces:
                 too_small = True
@@ -3437,7 +3455,13 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
                 too_small = True
             if too_small:
                 small_roots.add(root)
-        log(f'  {len(small_roots)} small islands flagged for merging')
+        log(f'  components: {len(comp_faces)} total, {len(small_roots)} flagged small')
+        log(f'  faces histogram: {hist_faces}')
+        log(f'  min(dx,dy) histogram: {hist_xy}')
+        largest.sort(reverse=True)
+        log(f'  top-5 largest components by face count:')
+        for nf, dx, dy, dz, root in largest[:5]:
+            log(f'    faces={nf}  bbox dx={dx*1000:.1f}mm dy={dy*1000:.1f}mm dz={dz*1000:.1f}mm')
 
         if not small_roots:
             return 0
