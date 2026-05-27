@@ -2926,6 +2926,11 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         name='Min Island Faces', default=20, min=0, max=100000,
         description='Islands with fewer than this many faces are merged regardless of size. Safeguard against degenerate slivers',
     )
+    min_island_feature_width: bpy.props.FloatProperty(
+        name='Min Feature Width (OBB)', default=0.0, min=0.0, max=10.0,
+        description='Minimum width along the smallest principal axis (oriented bounding box). Catches thin features regardless of orientation. 0 = disabled. Recommended 3mm for 0.4mm nozzle prints',
+        unit='LENGTH', precision=4,
+    )
 
     _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
@@ -3398,11 +3403,11 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             comp_faces[int(parent[pi])].append(pi)
         log(f'  {len(comp_faces)} connected components')
 
-        # bbox per component
+        # bbox per component + OBB minimum extent
         comp_bbox = {}
+        comp_obb_min = {}
         for root, faces in comp_faces.items():
             faces_arr = np.array(faces, dtype=np.int32)
-            # gather vert indices for these faces
             vis = []
             for fi in faces_arr:
                 s = int(poly_loop_start[fi]); t = int(poly_loop_total[fi])
@@ -3410,21 +3415,39 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             vi = np.concatenate(vis) if vis else np.empty(0, dtype=np.int32)
             if vi.size == 0:
                 comp_bbox[root] = (np.zeros(3), np.zeros(3))
+                comp_obb_min[root] = 0.0
                 continue
             uniq = np.unique(vi)
             vs = v_world[uniq]
             comp_bbox[root] = (vs.min(axis=0), vs.max(axis=0))
+            # OBB via PCA: smallest principal-axis extent
+            if vs.shape[0] >= 3:
+                mean = vs.mean(axis=0)
+                centered = vs - mean
+                try:
+                    cov = centered.T @ centered / max(1, vs.shape[0] - 1)
+                    _eigvals, eigvecs = np.linalg.eigh(cov.astype(np.float64))
+                    projected = centered.astype(np.float64) @ eigvecs
+                    obb_ext = projected.max(axis=0) - projected.min(axis=0)
+                    comp_obb_min[root] = float(obb_ext.min())
+                except np.linalg.LinAlgError:
+                    # fallback to AABB minimum if PCA fails
+                    extent = comp_bbox[root][1] - comp_bbox[root][0]
+                    comp_obb_min[root] = float(extent.min())
+            else:
+                extent = comp_bbox[root][1] - comp_bbox[root][0]
+                comp_obb_min[root] = float(extent.min())
 
         yield ('Merging islands: finding small ones...', 64)
         min_x = float(self.min_island_size_x)
         min_y = float(self.min_island_size_y)
         min_z = float(self.min_island_size_z)
+        min_w = float(self.min_island_feature_width)
         min_faces = int(self.min_island_face_count)
         small_roots = set()
-        # Histogram diagnostics
         hist_faces = {'<5': 0, '5-20': 0, '20-100': 0, '100-1000': 0, '1000+': 0}
         hist_xy = {'<1mm': 0, '1-3mm': 0, '3-10mm': 0, '10-50mm': 0, '50mm+': 0}
-        # Top-5 largest by face count (potential giant components)
+        hist_obb = {'<1mm': 0, '1-3mm': 0, '3-10mm': 0, '10-50mm': 0, '50mm+': 0}
         largest = []
         for root, faces in comp_faces.items():
             n_f = len(faces)
@@ -3432,18 +3455,19 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             extent = bmax - bmin
             dx, dy, dz = float(extent[0]), float(extent[1]), float(extent[2])
             xy_min = min(dx, dy)
-            # Histogram
+            obb_w = comp_obb_min.get(root, 0.0)
             if n_f < 5: hist_faces['<5'] += 1
             elif n_f < 20: hist_faces['5-20'] += 1
             elif n_f < 100: hist_faces['20-100'] += 1
             elif n_f < 1000: hist_faces['100-1000'] += 1
             else: hist_faces['1000+'] += 1
-            if xy_min < 0.001: hist_xy['<1mm'] += 1
-            elif xy_min < 0.003: hist_xy['1-3mm'] += 1
-            elif xy_min < 0.010: hist_xy['3-10mm'] += 1
-            elif xy_min < 0.050: hist_xy['10-50mm'] += 1
-            else: hist_xy['50mm+'] += 1
-            largest.append((n_f, dx, dy, dz, root))
+            for h, val in ((hist_xy, xy_min), (hist_obb, obb_w)):
+                if val < 0.001: h['<1mm'] += 1
+                elif val < 0.003: h['1-3mm'] += 1
+                elif val < 0.010: h['3-10mm'] += 1
+                elif val < 0.050: h['10-50mm'] += 1
+                else: h['50mm+'] += 1
+            largest.append((n_f, dx, dy, dz, obb_w, root))
             too_small = False
             if min_faces > 0 and n_f < min_faces:
                 too_small = True
@@ -3453,15 +3477,18 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
                 too_small = True
             if min_z > 0.0 and dz < min_z:
                 too_small = True
+            if min_w > 0.0 and obb_w < min_w:
+                too_small = True
             if too_small:
                 small_roots.add(root)
         log(f'  components: {len(comp_faces)} total, {len(small_roots)} flagged small')
         log(f'  faces histogram: {hist_faces}')
-        log(f'  min(dx,dy) histogram: {hist_xy}')
+        log(f'  AABB min(dx,dy) histogram: {hist_xy}')
+        log(f'  OBB min-width histogram:    {hist_obb}')
         largest.sort(reverse=True)
         log(f'  top-5 largest components by face count:')
-        for nf, dx, dy, dz, root in largest[:5]:
-            log(f'    faces={nf}  bbox dx={dx*1000:.1f}mm dy={dy*1000:.1f}mm dz={dz*1000:.1f}mm')
+        for nf, dx, dy, dz, ow, root in largest[:5]:
+            log(f'    faces={nf}  AABB dx={dx*1000:.1f}mm dy={dy*1000:.1f}mm dz={dz*1000:.1f}mm  OBB-min={ow*1000:.1f}mm')
 
         if not small_roots:
             return 0
@@ -3504,10 +3531,12 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         layout.prop(self, 'merge_small_islands')
         sub = layout.column(align=True)
         sub.enabled = self.merge_small_islands
-        sub.label(text='Min bbox per axis (0 = ignore axis):')
+        sub.label(text='Axis-aligned bbox thresholds (0 = ignore):')
         sub.prop(self, 'min_island_size_x')
         sub.prop(self, 'min_island_size_y')
         sub.prop(self, 'min_island_size_z')
+        sub.label(text='Oriented bbox / face count:')
+        sub.prop(self, 'min_island_feature_width')
         sub.prop(self, 'min_island_face_count')
         col = layout.column(align=True)
         col.label(text='Advanced:')
@@ -3658,6 +3687,7 @@ class SNA_OT_test_merge_islands(bpy.types.Operator):
         stub.min_island_size_y = 0.015
         stub.min_island_size_z = 0.0   # plane has no Z extent — disable
         stub.min_island_face_count = 0
+        stub.min_island_feature_width = 0.0  # disable OBB check for plane test
 
         gen = SNA_OT_auto_palette_split._merge_islands_gen(stub, plane, face_labels, p)
         reassigned = 0
