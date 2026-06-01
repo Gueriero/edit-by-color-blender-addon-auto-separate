@@ -2683,6 +2683,39 @@ def _sna_hsv_dist(a, b):
     return math.sqrt(dh * dh + ds * ds + dv * dv)
 
 
+def _sna_make_bary_pts(n):
+    """Return list of (u, v, w) barycentric coords, sqrt-spaced inside triangle."""
+    import math
+    pts = []
+    k = int(math.ceil(math.sqrt(n)))
+    for i in range(1, k + 2):
+        for j in range(1, k - i + 3):
+            a = i / (k + 2); b = j / (k + 2); c = 1.0 - a - b
+            if c > 0:
+                pts.append((a, b, c))
+    if not pts:
+        pts = [(1/3, 1/3, 1/3)]
+    if len(pts) > n:
+        pts = pts[:n]
+    return pts
+
+
+def _sna_rgb_to_hsv_np(arr):
+    """arr: (N,3) float32 RGB → (N,3) float32 HSV."""
+    import numpy as np
+    r, g, b = arr[:, 0], arr[:, 1], arr[:, 2]
+    mx = np.max(arr, axis=1); mn = np.min(arr, axis=1)
+    d = mx - mn
+    s = np.where(mx > 0, d / np.maximum(mx, 1e-8), 0.0)
+    rc = np.where(d > 0, (mx - r) / np.maximum(d, 1e-8), 0.0)
+    gc = np.where(d > 0, (mx - g) / np.maximum(d, 1e-8), 0.0)
+    bc = np.where(d > 0, (mx - b) / np.maximum(d, 1e-8), 0.0)
+    h_ = np.where(r == mx, bc - gc,
+          np.where(g == mx, 2.0 + rc - bc, 4.0 + gc - rc))
+    h_ = (h_ / 6.0) % 1.0
+    return np.stack([h_, s, mx], axis=1)
+
+
 class SNA_OT_palette_split_and_colorize(bpy.types.Operator):
     bl_idname = 'sna.palette_split_and_colorize'
     bl_label = 'Split & Colorize by Palette'
@@ -2748,20 +2781,7 @@ class SNA_OT_palette_split_and_colorize(bpy.types.Operator):
             i = (y * w + x) * 4
             return px[i], px[i+1], px[i+2]
 
-        n = max(1, self.samples_per_face)
-        bary_pts = []
-        k = int(math.ceil(math.sqrt(n)))
-        for i in range(1, k + 2):
-            for j in range(1, k - i + 3):
-                a = i / (k + 2)
-                b = j / (k + 2)
-                c = 1.0 - a - b
-                if c > 0:
-                    bary_pts.append((a, b, c))
-        if not bary_pts:
-            bary_pts = [(1/3, 1/3, 1/3)]
-        if len(bary_pts) > n:
-            bary_pts = bary_pts[:n]
+        bary_pts = _sna_make_bary_pts(max(1, self.samples_per_face))
 
         pal_hsv = [colorsys.rgb_to_hsv(c.color[0], c.color[1], c.color[2]) for c in palette]
 
@@ -2784,13 +2804,11 @@ class SNA_OT_palette_split_and_colorize(bpy.types.Operator):
             if mat is None:
                 mat = bpy.data.materials.new(mat_name)
                 mat.use_nodes = True
-                bsdf = None
+            if mat.use_nodes and mat.node_tree:
                 for nd in mat.node_tree.nodes:
                     if nd.type == 'BSDF_PRINCIPLED':
-                        bsdf = nd
+                        nd.inputs['Base Color'].default_value = (br, bg, bb, 1.0)
                         break
-                if bsdf is not None:
-                    bsdf.inputs['Base Color'].default_value = (br, bg, bb, 1.0)
             mat.diffuse_color = (br, bg, bb, 1.0)
             slot_idx = -1
             for si, s in enumerate(obj.material_slots):
@@ -2903,6 +2921,11 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         name='Progressive Separate (logged)', default=False,
         description='Separate materials one by one with a console log per cluster. Slower but shows progress. Off = single fast bpy.ops.mesh.separate(MATERIAL) with no progress',
     )
+    solidify_thickness: bpy.props.FloatProperty(
+        name='Solidify Thickness', default=0.0, min=0.0, max=100.0,
+        description='If > 0, add a Solidify modifier to the source object before separation so each result piece becomes a closed volume for 3D printing. Recommend 0.4mm (nozzle width) to 1mm. Disabled when 0',
+        unit='LENGTH', precision=3, step=10,
+    )
     merge_small_islands: bpy.props.BoolProperty(
         name='Merge Small Islands', default=False,
         description='Find connected face regions per cluster; islands smaller than the threshold get merged into their majority neighbor cluster before separation. Reduces tiny print artifacts',
@@ -2930,6 +2953,10 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         name='Min Feature Width (OBB)', default=0.0, min=0.0, max=10.0,
         description='Minimum width along the smallest principal axis (oriented bounding box). Catches thin features regardless of orientation. 0 = disabled. Recommended 3mm for 0.4mm nozzle prints',
         unit='LENGTH', precision=4,
+    )
+    merge_max_iters: bpy.props.IntProperty(
+        name='Merge Iterations', default=8, min=1, max=30,
+        description='Repeat the small-island merge pass up to N times. Each iteration recomputes connected components on the updated labels — small clusters cascade-absorb into larger neighbors. Stops early on convergence. 1 = legacy single-pass behavior',
     )
     erosion_passes: bpy.props.IntProperty(
         name='Erosion Passes', default=0, min=0, max=20,
@@ -3067,19 +3094,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         img = npx.reshape(h, w, 4)[:, :, :3]
         log(f'Image read in {time.time() - t_start:.1f}s')
 
-        n = max(1, self.samples_per_face)
-        bary_pts = []
-        k = int(math.ceil(math.sqrt(n)))
-        for i in range(1, k + 2):
-            for j in range(1, k - i + 3):
-                a = i / (k + 2); b = j / (k + 2); c = 1.0 - a - b
-                if c > 0:
-                    bary_pts.append((a, b, c))
-        if not bary_pts:
-            bary_pts = [(1/3, 1/3, 1/3)]
-        if len(bary_pts) > n:
-            bary_pts = bary_pts[:n]
-        bary = np.array(bary_pts, dtype=np.float32)
+        bary = np.array(_sna_make_bary_pts(max(1, self.samples_per_face)), dtype=np.float32)
 
         me = obj.data
         uv_layer = me.uv_layers[uv_name].data
@@ -3129,22 +3144,9 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             yield (f'Sampling polygons {pct}% (ETA {eta:.0f}s)', int(pct * 0.4))
         log(f'Sampling done in {time.time() - t_sample:.1f}s')
 
-        def rgb_to_hsv_np(arr):
-            r, g, b = arr[:, 0], arr[:, 1], arr[:, 2]
-            mx = np.max(arr, axis=1); mn = np.min(arr, axis=1)
-            d = mx - mn
-            s = np.where(mx > 0, d / np.maximum(mx, 1e-8), 0.0)
-            rc = np.where(d > 0, (mx - r) / np.maximum(d, 1e-8), 0.0)
-            gc = np.where(d > 0, (mx - g) / np.maximum(d, 1e-8), 0.0)
-            bc = np.where(d > 0, (mx - b) / np.maximum(d, 1e-8), 0.0)
-            h_ = np.where(r == mx, bc - gc,
-                  np.where(g == mx, 2.0 + rc - bc, 4.0 + gc - rc))
-            h_ = (h_ / 6.0) % 1.0
-            return np.stack([h_, s, mx], axis=1)
-
         yield ('Preparing cluster space...', 42)
         if self.use_hsv:
-            cluster_data = rgb_to_hsv_np(face_colors)
+            cluster_data = _sna_rgb_to_hsv_np(face_colors)
             hx = np.cos(cluster_data[:, 0] * 2.0 * math.pi) * cluster_data[:, 1]
             hy = np.sin(cluster_data[:, 0] * 2.0 * math.pi) * cluster_data[:, 1]
             cluster_data = np.stack([hx, hy, cluster_data[:, 2]], axis=1)
@@ -3236,6 +3238,9 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             if mat is None:
                 mat = bpy.data.materials.new(mat_name)
                 mat.use_nodes = True
+            # always (re)write Base Color + diffuse — reused materials may carry
+            # stale colour from a previous run
+            if mat.use_nodes and mat.node_tree:
                 for nd in mat.node_tree.nodes:
                     if nd.type == 'BSDF_PRINCIPLED':
                         nd.inputs['Base Color'].default_value = (r, g, b, 1.0); break
@@ -3272,6 +3277,17 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             except Exception as e:
                 log(f'Could not remove modifier: {e}')
             yield ('Modifier removed', 72)
+
+        # Add Solidify modifier before separation so each separated object
+        # inherits a copy — open surfaces become closed volumes for slicers.
+        solidify_mm = float(getattr(self, 'solidify_thickness', 0.0))
+        if solidify_mm > 0.0:
+            mod = obj.modifiers.new('EBC_Solidify', 'SOLIDIFY')
+            mod.thickness = solidify_mm
+            mod.offset = 0.0        # even thickness
+            mod.use_even_offset = True
+            mod.use_quality_normals = True
+            log(f'Added Solidify modifier (thickness={solidify_mm*1000:.1f}mm)')
 
         if self.do_separate and self.progressive_separate:
             log('Progressive separate via material_slot_select...')
@@ -3368,163 +3384,156 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         pair_a = sorted_polys[:-1][same_edge]
         pair_b = sorted_polys[1:][same_edge]
         log(f'  {len(pair_a)} adjacent face pairs')
-        yield ('Merging islands: union-find...', 62)
-
-        # Union-find within same cluster label
-        parent = np.arange(n_polys, dtype=np.int32)
-
-        def find(x):
-            r = x
-            while parent[r] != r:
-                r = parent[r]
-            while parent[x] != r:
-                parent[x], x = r, parent[x]
-            return r
-
-        same_label_mask = face_labels[pair_a] == face_labels[pair_b]
-        pa = pair_a[same_label_mask].tolist()
-        pb = pair_b[same_label_mask].tolist()
-        for a, b in zip(pa, pb):
-            ra = find(a); rb = find(b)
-            if ra != rb:
-                if ra < rb:
-                    parent[rb] = ra
-                else:
-                    parent[ra] = rb
-        # Path compress all
-        for i in range(n_polys):
-            find(i)
-        log(f'  union-find done in {time.time() - t0:.1f}s')
-        yield ('Merging islands: component stats...', 63)
-
-        # Component face lists + bboxes + face counts
+        # world vertex coords — built ONCE, reused each iter
         v_co = np.empty(n_verts * 3, dtype=np.float32)
         mesh.vertices.foreach_get('co', v_co)
         v_co = v_co.reshape(n_verts, 3)
-        # world transform
         M = np.array(obj.matrix_world, dtype=np.float32)
         R = M[:3, :3]; T = M[:3, 3]
         v_world = v_co @ R.T + T
 
-        comp_faces = defaultdict(list)
-        for pi in range(n_polys):
-            comp_faces[int(parent[pi])].append(pi)
-        log(f'  {len(comp_faces)} connected components')
-
-        # bbox per component + OBB minimum extent
-        comp_bbox = {}
-        comp_obb_min = {}
-        for root, faces in comp_faces.items():
-            faces_arr = np.array(faces, dtype=np.int32)
-            vis = []
-            for fi in faces_arr:
-                s = int(poly_loop_start[fi]); t = int(poly_loop_total[fi])
-                vis.append(loop_verts[s:s + t])
-            vi = np.concatenate(vis) if vis else np.empty(0, dtype=np.int32)
-            if vi.size == 0:
-                comp_bbox[root] = (np.zeros(3), np.zeros(3))
-                comp_obb_min[root] = 0.0
-                continue
-            uniq = np.unique(vi)
-            vs = v_world[uniq]
-            comp_bbox[root] = (vs.min(axis=0), vs.max(axis=0))
-            # OBB via PCA: smallest principal-axis extent
-            if vs.shape[0] >= 3:
-                mean = vs.mean(axis=0)
-                centered = vs - mean
-                try:
-                    cov = centered.T @ centered / max(1, vs.shape[0] - 1)
-                    _eigvals, eigvecs = np.linalg.eigh(cov.astype(np.float64))
-                    projected = centered.astype(np.float64) @ eigvecs
-                    obb_ext = projected.max(axis=0) - projected.min(axis=0)
-                    comp_obb_min[root] = float(obb_ext.min())
-                except np.linalg.LinAlgError:
-                    # fallback to AABB minimum if PCA fails
-                    extent = comp_bbox[root][1] - comp_bbox[root][0]
-                    comp_obb_min[root] = float(extent.min())
-            else:
-                extent = comp_bbox[root][1] - comp_bbox[root][0]
-                comp_obb_min[root] = float(extent.min())
-
-        yield ('Merging islands: finding small ones...', 64)
         min_x = float(self.min_island_size_x)
         min_y = float(self.min_island_size_y)
         min_z = float(self.min_island_size_z)
         min_w = float(self.min_island_feature_width)
         min_faces = int(self.min_island_face_count)
-        small_roots = set()
-        hist_faces = {'<5': 0, '5-20': 0, '20-100': 0, '100-1000': 0, '1000+': 0}
-        hist_xy = {'<1mm': 0, '1-3mm': 0, '3-10mm': 0, '10-50mm': 0, '50mm+': 0}
-        hist_obb = {'<1mm': 0, '1-3mm': 0, '3-10mm': 0, '10-50mm': 0, '50mm+': 0}
-        largest = []
-        for root, faces in comp_faces.items():
-            n_f = len(faces)
-            bmin, bmax = comp_bbox[root]
-            extent = bmax - bmin
-            dx, dy, dz = float(extent[0]), float(extent[1]), float(extent[2])
-            xy_min = min(dx, dy)
-            obb_w = comp_obb_min.get(root, 0.0)
-            if n_f < 5: hist_faces['<5'] += 1
-            elif n_f < 20: hist_faces['5-20'] += 1
-            elif n_f < 100: hist_faces['20-100'] += 1
-            elif n_f < 1000: hist_faces['100-1000'] += 1
-            else: hist_faces['1000+'] += 1
-            for h, val in ((hist_xy, xy_min), (hist_obb, obb_w)):
-                if val < 0.001: h['<1mm'] += 1
-                elif val < 0.003: h['1-3mm'] += 1
-                elif val < 0.010: h['3-10mm'] += 1
-                elif val < 0.050: h['10-50mm'] += 1
-                else: h['50mm+'] += 1
-            largest.append((n_f, dx, dy, dz, obb_w, root))
-            too_small = False
-            if min_faces > 0 and n_f < min_faces:
-                too_small = True
-            if min_x > 0.0 and dx < min_x:
-                too_small = True
-            if min_y > 0.0 and dy < min_y:
-                too_small = True
-            if min_z > 0.0 and dz < min_z:
-                too_small = True
-            if min_w > 0.0 and obb_w < min_w:
-                too_small = True
-            if too_small:
-                small_roots.add(root)
-        log(f'  components: {len(comp_faces)} total, {len(small_roots)} flagged small')
-        log(f'  faces histogram: {hist_faces}')
-        log(f'  AABB min(dx,dy) histogram: {hist_xy}')
-        log(f'  OBB min-width histogram:    {hist_obb}')
-        largest.sort(reverse=True)
-        log(f'  top-5 largest components by face count:')
-        for nf, dx, dy, dz, ow, root in largest[:5]:
-            log(f'    faces={nf}  AABB dx={dx*1000:.1f}mm dy={dy*1000:.1f}mm dz={dz*1000:.1f}mm  OBB-min={ow*1000:.1f}mm')
+        max_iters = int(getattr(self, 'merge_max_iters', 8))
 
-        if not small_roots:
-            return 0
-
-        # Tally neighbor cluster labels per small root via cross-cluster pairs
-        cross_mask = face_labels[pair_a] != face_labels[pair_b]
-        cross_a = pair_a[cross_mask]
-        cross_b = pair_b[cross_mask]
-
-        comp_neighbor_counts = defaultdict(lambda: defaultdict(int))
-        for ai, bi in zip(cross_a.tolist(), cross_b.tolist()):
-            ra = int(parent[ai]); rb = int(parent[bi])
-            if ra in small_roots:
-                comp_neighbor_counts[ra][int(face_labels[bi])] += 1
-            if rb in small_roots:
-                comp_neighbor_counts[rb][int(face_labels[ai])] += 1
-
-        yield ('Merging islands: reassigning faces...', 65)
         reassigned = 0
-        for root in small_roots:
-            nbrs = comp_neighbor_counts.get(root)
-            if not nbrs:
-                continue
-            majority = max(nbrs.items(), key=lambda kv: kv[1])[0]
-            faces = comp_faces[root]
-            face_labels[faces] = majority
-            reassigned += len(faces)
-        log(f'  reassigned {reassigned} faces across {len(small_roots)} islands')
+        for it in range(max_iters):
+            yield (f'Merging islands iter {it+1}/{max_iters}: union-find...', 62)
+
+            # Union-find within same cluster label (fresh each iter)
+            parent = np.arange(n_polys, dtype=np.int32)
+
+            def find(x, parent=parent):
+                r = x
+                while parent[r] != r:
+                    r = parent[r]
+                while parent[x] != r:
+                    parent[x], x = r, parent[x]
+                return r
+
+            same_label_mask = face_labels[pair_a] == face_labels[pair_b]
+            pa = pair_a[same_label_mask].tolist()
+            pb = pair_b[same_label_mask].tolist()
+            for a, b in zip(pa, pb):
+                ra = find(a); rb = find(b)
+                if ra != rb:
+                    if ra < rb:
+                        parent[rb] = ra
+                    else:
+                        parent[ra] = rb
+            for i in range(n_polys):
+                find(i)
+
+            comp_faces = defaultdict(list)
+            for pi in range(n_polys):
+                comp_faces[int(parent[pi])].append(pi)
+
+            # bbox + OBB per component
+            comp_bbox = {}
+            comp_obb_min = {}
+            for root, faces in comp_faces.items():
+                vis = []
+                for fi in faces:
+                    s = int(poly_loop_start[fi]); t = int(poly_loop_total[fi])
+                    vis.append(loop_verts[s:s + t])
+                vi = np.concatenate(vis) if vis else np.empty(0, dtype=np.int32)
+                if vi.size == 0:
+                    comp_bbox[root] = (np.zeros(3), np.zeros(3))
+                    comp_obb_min[root] = 0.0
+                    continue
+                uniq = np.unique(vi)
+                vs = v_world[uniq]
+                comp_bbox[root] = (vs.min(axis=0), vs.max(axis=0))
+                if vs.shape[0] >= 3:
+                    mean = vs.mean(axis=0)
+                    centered = vs - mean
+                    try:
+                        cov = centered.T @ centered / max(1, vs.shape[0] - 1)
+                        _ev, evecs = np.linalg.eigh(cov.astype(np.float64))
+                        projected = centered.astype(np.float64) @ evecs
+                        obb_ext = projected.max(axis=0) - projected.min(axis=0)
+                        comp_obb_min[root] = float(obb_ext.min())
+                    except np.linalg.LinAlgError:
+                        extent = comp_bbox[root][1] - comp_bbox[root][0]
+                        comp_obb_min[root] = float(extent.min())
+                else:
+                    extent = comp_bbox[root][1] - comp_bbox[root][0]
+                    comp_obb_min[root] = float(extent.min())
+
+            small_roots = set()
+            hist_faces = {'<5': 0, '5-20': 0, '20-100': 0, '100-1000': 0, '1000+': 0}
+            hist_obb = {'<1mm': 0, '1-3mm': 0, '3-10mm': 0, '10-50mm': 0, '50mm+': 0}
+            for root, faces in comp_faces.items():
+                n_f = len(faces)
+                bmin, bmax = comp_bbox[root]
+                extent = bmax - bmin
+                dx, dy, dz = float(extent[0]), float(extent[1]), float(extent[2])
+                obb_w = comp_obb_min.get(root, 0.0)
+                if n_f < 5: hist_faces['<5'] += 1
+                elif n_f < 20: hist_faces['5-20'] += 1
+                elif n_f < 100: hist_faces['20-100'] += 1
+                elif n_f < 1000: hist_faces['100-1000'] += 1
+                else: hist_faces['1000+'] += 1
+                if obb_w < 0.001: hist_obb['<1mm'] += 1
+                elif obb_w < 0.003: hist_obb['1-3mm'] += 1
+                elif obb_w < 0.010: hist_obb['3-10mm'] += 1
+                elif obb_w < 0.050: hist_obb['10-50mm'] += 1
+                else: hist_obb['50mm+'] += 1
+                too_small = False
+                if min_faces > 0 and n_f < min_faces: too_small = True
+                if min_x > 0.0 and dx < min_x: too_small = True
+                if min_y > 0.0 and dy < min_y: too_small = True
+                if min_z > 0.0 and dz < min_z: too_small = True
+                if min_w > 0.0 and obb_w < min_w: too_small = True
+                if too_small:
+                    small_roots.add(root)
+            log(f'  iter {it+1}: {len(comp_faces)} components, {len(small_roots)} small')
+            log(f'    faces hist: {hist_faces}')
+            log(f'    OBB hist:   {hist_obb}')
+
+            if not small_roots:
+                log(f'  converged at iter {it+1}')
+                break
+
+            # Adjacency between components via cross-component edge pairs
+            roots_a = parent[pair_a]
+            roots_b = parent[pair_b]
+            cross_mask = roots_a != roots_b
+            cra = roots_a[cross_mask].tolist()
+            crb = roots_b[cross_mask].tolist()
+
+            # shared-boundary length per (small_root, neighbor_root): count cross-edges
+            small_neighbors = defaultdict(lambda: defaultdict(int))
+            for ra, rb in zip(cra, crb):
+                if ra in small_roots:
+                    small_neighbors[ra][rb] += 1
+                if rb in small_roots:
+                    small_neighbors[rb][ra] += 1
+
+            yield (f'Merging islands iter {it+1}/{max_iters}: reassigning...', 65)
+            iter_reassigned = 0
+            for root in small_roots:
+                nbrs = small_neighbors.get(root)
+                if not nbrs:
+                    continue
+                # prefer non-small neighbors; fall back to small ones
+                non_small = {c: w for c, w in nbrs.items() if c not in small_roots}
+                pool = non_small if non_small else nbrs
+                # pick by longest shared boundary; tie-break by neighbor size
+                target = max(pool.items(), key=lambda kv: (kv[1], len(comp_faces[kv[0]])))[0]
+                target_label = int(face_labels[comp_faces[target][0]])
+                faces = comp_faces[root]
+                face_labels[faces] = target_label
+                iter_reassigned += len(faces)
+
+            log(f'  iter {it+1}: reassigned {iter_reassigned} faces')
+            reassigned += iter_reassigned
+            if iter_reassigned == 0:
+                log(f'  no progress at iter {it+1}, stopping')
+                break
 
         # Optional morphological erosion passes
         passes = int(getattr(self, 'erosion_passes', 0))
@@ -3581,6 +3590,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         layout.prop(self, 'do_separate')
         layout.prop(self, 'progressive_separate')
         layout.prop(self, 'remove_modifier')
+        layout.prop(self, 'solidify_thickness')
         layout.separator()
         layout.prop(self, 'merge_small_islands')
         sub = layout.column(align=True)
@@ -3592,6 +3602,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         sub.label(text='Oriented bbox / face count:')
         sub.prop(self, 'min_island_feature_width')
         sub.prop(self, 'min_island_face_count')
+        sub.prop(self, 'merge_max_iters')
         sub.label(text='Morphological smoothing:')
         sub.prop(self, 'erosion_passes')
         sub.prop(self, 'erosion_strength')
@@ -3747,6 +3758,7 @@ class SNA_OT_test_merge_islands(bpy.types.Operator):
         stub.min_island_feature_width = 0.0  # disable OBB check for plane test
         stub.erosion_passes = 0
         stub.erosion_strength = 0.7
+        stub.merge_max_iters = 8
 
         gen = SNA_OT_auto_palette_split._merge_islands_gen(stub, plane, face_labels, p)
         reassigned = 0
