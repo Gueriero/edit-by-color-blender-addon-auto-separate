@@ -1242,6 +1242,8 @@ class SNA_PT_EDIT_BY_COLOUR_BY_KIRI_ENGINE_955BF(bpy.types.Panel):
         sna_palette_split_interface(layout)
         layout.separator(factor=1.0)
         sna_auto_palette_interface(layout)
+        layout.separator(factor=1.0)
+        sna_voxel_block_remesh_interface(layout)
 
 
 class SNA_OT_Open_Edit_By_Colour_Documentation_1Eac5(bpy.types.Operator):
@@ -4281,6 +4283,130 @@ class SNA_OT_test_progressive_separate(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SNA_OT_test_voxel_block_remesh(bpy.types.Operator):
+    bl_idname = 'sna.test_voxel_block_remesh'
+    bl_label = 'Self-Test: Voxel Block Remesh'
+    bl_description = 'Builds a UV-mapped cube with checker texture, runs voxel occupancy + face extraction, validates output. Reports PASS/FAIL in console'
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        import numpy as np
+
+        def p(msg):
+            print(f'[TestVoxel] {msg}', flush=True)
+
+        p('=== test start ===')
+        bpy.ops.object.select_all(action='DESELECT')
+        bpy.ops.mesh.primitive_cube_add(size=2, location=(0, 0, 0))
+        cube = context.active_object
+        cube.name = '_ebc_test_voxel_cube'
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.subdivide(number_cuts=2)
+        bpy.ops.uv.cube_project()
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        img = bpy.data.images.new('_ebc_test_voxel_tex', 64, 64, alpha=False)
+        px = np.zeros(64 * 64 * 4, dtype=np.float32)
+        for y in range(64):
+            for x in range(64):
+                i = (y * 64 + x) * 4
+                if (x // 8 + y // 8) % 2 == 0:
+                    px[i] = 1.0; px[i+1] = 0.0; px[i+2] = 0.0
+                else:
+                    px[i] = 0.0; px[i+1] = 1.0; px[i+2] = 0.0
+        img.pixels[:] = px.tolist()
+        p('created test texture 64x64')
+
+        import mathutils
+        mesh = cube.data
+        n_verts = len(mesh.vertices)
+        verts_local = np.empty(n_verts * 3, dtype=np.float32)
+        mesh.vertices.foreach_get('co', verts_local)
+        verts_local = verts_local.reshape(n_verts, 3)
+        verts_world = verts_local.copy()  # cube at origin, identity matrix
+
+        verts_list = verts_world.tolist()
+        polys_list = []
+        poly_loop_start = np.empty(len(mesh.polygons), dtype=np.int32)
+        poly_loop_total = np.empty(len(mesh.polygons), dtype=np.int32)
+        mesh.polygons.foreach_get('loop_start', poly_loop_start)
+        mesh.polygons.foreach_get('loop_total', poly_loop_total)
+        loop_verts = np.empty(len(mesh.loops), dtype=np.int32)
+        mesh.loops.foreach_get('vertex_index', loop_verts)
+        for pi in range(len(mesh.polygons)):
+            s = int(poly_loop_start[pi]); t = int(poly_loop_total[pi])
+            vs = loop_verts[s:s + t].tolist()
+            for ti in range(1, t - 1):
+                polys_list.append((vs[0], vs[ti], vs[ti + 1]))
+
+        bvh = mathutils.bvhtree.BVHTree.FromPolygons(verts_list, polys_list)
+        p(f'BVHTree: {len(polys_list)} tris — OK')
+
+        depth = 3; grid_size = 1 << depth
+        bbox_min = np.min(verts_world, axis=0); bbox_max = np.max(verts_world, axis=0)
+        cell_size_ = np.max(bbox_max - bbox_min) / grid_size
+        bbox_min -= cell_size_; bbox_max += cell_size_
+        max_dim = np.max(bbox_max - bbox_min)
+        center_ = (bbox_min + bbox_max) / 2.0; half_ = max_dim / 2.0
+        bbox_min = center_ - half_; bbox_max = center_ + half_
+        cell_size_ = max_dim / grid_size
+        half_diag = cell_size_ * np.sqrt(3) * 0.5
+        DIRS = [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]
+
+        occupied = set()
+        for fi, tri_verts_idx in enumerate(polys_list):
+            v0 = verts_world[tri_verts_idx[0]]
+            v1 = verts_world[tri_verts_idx[1]]
+            v2 = verts_world[tri_verts_idx[2]]
+            tri_min = np.minimum(np.minimum(v0, v1), v2)
+            tri_max = np.maximum(np.maximum(v0, v1), v2)
+            ix0 = max(0, int((tri_min[0] - bbox_min[0]) / cell_size_))
+            iy0 = max(0, int((tri_min[1] - bbox_min[1]) / cell_size_))
+            iz0 = max(0, int((tri_min[2] - bbox_min[2]) / cell_size_))
+            ix1 = min(grid_size - 1, int((tri_max[0] - bbox_min[0]) / cell_size_) + 1)
+            iy1 = min(grid_size - 1, int((tri_max[1] - bbox_min[1]) / cell_size_) + 1)
+            iz1 = min(grid_size - 1, int((tri_max[2] - bbox_min[2]) / cell_size_) + 1)
+            for ix in range(ix0, ix1 + 1):
+                for iy in range(iy0, iy1 + 1):
+                    for iz in range(iz0, iz1 + 1):
+                        key = (ix, iy, iz)
+                        if key in occupied:
+                            continue
+                        cx = bbox_min[0] + (ix + 0.5) * cell_size_
+                        cy = bbox_min[1] + (iy + 0.5) * cell_size_
+                        cz = bbox_min[2] + (iz + 0.5) * cell_size_
+                        nearest = bvh.find_nearest(mathutils.Vector((cx, cy, cz)))
+                        if nearest is not None and nearest[3] < half_diag:
+                            occupied.add(key)
+
+        p(f'Occupied: {len(occupied)} / {grid_size**3} voxels')
+
+        faces_to_emit = []
+        for (ix, iy, iz) in occupied:
+            for di, (dx, dy, dz) in enumerate(DIRS):
+                neighbor = (ix + dx, iy + dy, iz + dz)
+                if neighbor not in occupied:
+                    faces_to_emit.append((ix, iy, iz, di))
+
+        n_surface = len(faces_to_emit)
+        n_potential = len(occupied) * 6
+        p(f'Surface faces: {n_surface} / {n_potential} potential')
+
+        ok = n_surface > 0 and n_surface < n_potential
+        if ok:
+            p('=== PASS ===')
+            self.report({'INFO'}, f'TestVoxel PASS: {len(occupied)} voxels, {n_surface} faces')
+        else:
+            p(f'=== FAIL: faces={n_surface} occupied={len(occupied)} ===')
+            self.report({'ERROR'}, 'TestVoxel FAIL')
+
+        bpy.data.objects.remove(cube, do_unlink=True)
+        bpy.data.images.remove(img, do_unlink=True)
+        return {'FINISHED' if ok else 'CANCELLED'}
+
+
 class SNA_OT_test_merge_islands(bpy.types.Operator):
     bl_idname = 'sna.test_merge_islands'
     bl_label = 'Self-Test: Merge Small Islands'
@@ -4405,6 +4531,20 @@ def sna_auto_palette_interface(layout_function):
                  icon_value=string_to_icon('EXPERIMENTAL'))
 
 
+def sna_voxel_block_remesh_interface(layout_function):
+    box = layout_function.box()
+    box.label(text='Voxel Block Remesh (3D Print)', icon_value=string_to_icon('MESH_CUBE'))
+    obj = bpy.context.view_layer.objects.active
+    mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN') if obj else None
+    if mod is not None:
+        box.operator('sna.voxel_block_remesh', text='Voxel Remesh & Colorize',
+                     icon_value=string_to_icon('MOD_BUILD'))
+    else:
+        box.label(text='Add Edit By Colour modifier first', icon_value=0)
+    box.operator('sna.test_voxel_block_remesh', text='Self-Test: Voxel Block Remesh',
+                 icon_value=string_to_icon('EXPERIMENTAL'))
+
+
 def sna_palette_split_interface(layout_function):
     box = layout_function.box()
     box.label(text='Palette Split (3D Print)', icon_value=string_to_icon('COLOR'))
@@ -4467,6 +4607,8 @@ def register():
     bpy.utils.register_class(SNA_OT_remove_ebc_modifier_from_selected)
     bpy.utils.register_class(SNA_OT_test_progressive_separate)
     bpy.utils.register_class(SNA_OT_test_merge_islands)
+    bpy.utils.register_class(SNA_OT_voxel_block_remesh)
+    bpy.utils.register_class(SNA_OT_test_voxel_block_remesh)
     bpy.types.Scene.sna_palette_colors = bpy.props.CollectionProperty(type=SNA_PaletteColorItem)
     bpy.types.Scene.sna_palette_active_index = bpy.props.IntProperty(default=0)
 
@@ -4514,6 +4656,8 @@ def unregister():
     del bpy.types.Scene.sna_palette_active_index
     del bpy.types.Scene.sna_palette_colors
     bpy.utils.unregister_class(SNA_OT_test_merge_islands)
+    bpy.utils.unregister_class(SNA_OT_test_voxel_block_remesh)
+    bpy.utils.unregister_class(SNA_OT_voxel_block_remesh)
     bpy.utils.unregister_class(SNA_OT_test_progressive_separate)
     bpy.utils.unregister_class(SNA_OT_remove_ebc_modifier_from_selected)
     bpy.utils.unregister_class(SNA_OT_auto_palette_split)
