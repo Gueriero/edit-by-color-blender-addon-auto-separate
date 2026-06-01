@@ -4061,12 +4061,23 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
 
         # Phase 8: Create materials (one per non-empty cluster)
         yield ('Creating materials...', 56)
-        # Compute per-cluster mean RGB from original face colors (like Auto Palette Split)
-        cluster_rgb = np.zeros((K, 3), dtype=np.float32)
-        for c in range(K):
-            mask = face_labels == c
-            if mask.any():
-                cluster_rgb[c] = face_colors[mask].mean(axis=0)
+        if self.use_hsv:
+            # Recover HSV from encoded centroids (hx=cos(H)*S, hy=sin(H)*S, V)
+            h_recovered = (np.arctan2(centers[:, 1], centers[:, 0]) / (2.0 * math.pi)) % 1.0
+            s_recovered = np.sqrt(centers[:, 0]**2 + centers[:, 1]**2)
+            s_recovered = np.clip(s_recovered, 0.0, 1.0)
+            v_recovered = centers[:, 2]
+            cluster_rgb = np.zeros((K, 3), dtype=np.float32)
+            import colorsys
+            for c in range(K):
+                r, g, b = colorsys.hsv_to_rgb(float(h_recovered[c]), float(s_recovered[c]), float(v_recovered[c]))
+                cluster_rgb[c] = (r, g, b)
+        else:
+            cluster_rgb = np.zeros((K, 3), dtype=np.float32)
+            for c in range(K):
+                mask = face_labels == c
+                if mask.any():
+                    cluster_rgb[c] = face_colors[mask].mean(axis=0)
 
         slot_map = {}
         for c in range(K):
