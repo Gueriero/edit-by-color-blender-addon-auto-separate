@@ -3648,6 +3648,117 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
 
     _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=350)
+
+    def execute(self, context):
+        import numpy as np
+
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, 'No active mesh'); return {'CANCELLED'}
+        mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN')
+        if mod is None:
+            self.report({'ERROR'}, 'Add Edit By Colour modifier first'); return {'CANCELLED'}
+        try: uv_name = mod['Socket_2']
+        except Exception: uv_name = ''
+        try: image = mod['Socket_4']
+        except Exception: image = None
+        if not uv_name or uv_name not in obj.data.uv_layers:
+            self.report({'ERROR'}, 'UV Map not set in modifier'); return {'CANCELLED'}
+        if image is None:
+            self.report({'ERROR'}, 'Base Texture not set in modifier'); return {'CANCELLED'}
+        if image.size[0] == 0 or image.size[1] == 0:
+            self.report({'ERROR'}, 'Image has zero size'); return {'CANCELLED'}
+
+        self._gen = self._work(context, obj, image, uv_name)
+        self._spin_idx = 0
+        self._last_text = ''
+        try:
+            first = next(self._gen)
+            self._apply_status(context, first)
+        except StopIteration:
+            self._cleanup(context)
+            return {'FINISHED'}
+        except Exception as e:
+            self._cleanup(context)
+            self.report({'ERROR'}, f'{type(e).__name__}: {e}')
+            return {'CANCELLED'}
+        wm = context.window_manager
+        wm.progress_begin(0, 100)
+        self._timer = wm.event_timer_add(0.08, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            print('[VoxelRemesh] cancelled by ESC', flush=True)
+            self._cleanup(context)
+            self.report({'WARNING'}, 'Voxel Block Remesh cancelled')
+            return {'CANCELLED'}
+        if event.type == 'TIMER':
+            try:
+                status = next(self._gen)
+                self._apply_status(context, status)
+            except StopIteration:
+                self._cleanup(context)
+                return {'FINISHED'}
+            except Exception as e:
+                print(f'[VoxelRemesh] FAILED: {type(e).__name__}: {e}', flush=True)
+                self._cleanup(context)
+                self.report({'ERROR'}, f'{type(e).__name__}: {e}')
+                return {'CANCELLED'}
+        return {'PASS_THROUGH'}
+
+    def _apply_status(self, context, status):
+        if isinstance(status, tuple):
+            if len(status) >= 2:
+                text, pct = status[0], status[1]
+            elif len(status) == 1:
+                text, pct = status[0], None
+            else:
+                text, pct = str(status), None
+        else:
+            text, pct = status, None
+        self._spin_idx = (self._spin_idx + 1) % len(self._SPIN)
+        spin = self._SPIN[self._spin_idx]
+        full = f'{spin}  EBC Voxel Remesh: {text}   (ESC to cancel)'
+        try:
+            if context.workspace:
+                context.workspace.status_text_set(full)
+        except Exception:
+            pass
+        if pct is not None:
+            try: context.window_manager.progress_update(max(0, min(100, int(pct))))
+            except Exception: pass
+        self._last_text = text
+
+    def _cleanup(self, context):
+        wm = context.window_manager
+        if getattr(self, '_timer', None) is not None:
+            try: wm.event_timer_remove(self._timer)
+            except Exception: pass
+            self._timer = None
+        try: wm.progress_end()
+        except Exception: pass
+        try:
+            if context.workspace:
+                context.workspace.status_text_set(None)
+        except Exception:
+            pass
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, 'octree_depth')
+        layout.prop(self, 'num_colors')
+        layout.prop(self, 'use_hsv')
+        layout.prop(self, 'do_separate')
+        layout.prop(self, 'remove_original')
+        col = layout.column(align=True)
+        col.label(text='Advanced:')
+        col.prop(self, 'kmeans_iters')
+        col.prop(self, 'kmeans_subsample')
+
 class SNA_OT_test_progressive_separate(bpy.types.Operator):
     bl_idname = 'sna.test_progressive_separate'
     bl_label = 'Self-Test: Progressive Separate'
