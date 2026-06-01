@@ -30,6 +30,7 @@ import bpy.utils.previews
 import os
 import bmesh
 import webbrowser
+import mathutils
 
 
 
@@ -3625,10 +3626,6 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         description='Size of each block/cube in millimeters. Smaller = finer blocks, more geometry',
         precision=1, step=10,
     )
-    samples_per_face: bpy.props.IntProperty(
-        name='Samples per Face', default=4, min=1, max=64,
-        description='Barycentric surface samples per polygon for voxel occupancy detection',
-    )
     num_colors: bpy.props.IntProperty(
         name='Total Colors', default=16, min=2, max=256,
         description='Number of palette colors (K for k-means). Each color becomes one material',
@@ -3757,7 +3754,6 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
     def draw(self, context):
         layout = self.layout
         layout.prop(self, 'cell_size_mm')
-        layout.prop(self, 'samples_per_face')
         layout.prop(self, 'num_colors')
         layout.prop(self, 'use_hsv')
         layout.prop(self, 'do_separate')
@@ -3849,46 +3845,69 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
 
         yield (f'Grid: {grid_size_x}×{grid_size_y}×{grid_size_z} = {total_cells} cells', 3)
 
-        # Sample mesh surface to find occupied voxels
-        samples = max(1, self.samples_per_face)
-        bary = _sna_make_bary_pts(samples)
-        n_bary = len(bary)
-        log(f'Sampling surface: {n_polys} polygons × {n_bary} samples = {n_polys * n_bary} total')
-
-        yield (f'Sampling surface ({n_polys} polys × {n_bary} samples)...', 5)
+        # Rasterize each polygon's surface onto the voxel grid.
+        # For each triangle (fan from vertex 0), walk its AABB in voxel coords
+        # and test each voxel center against the triangle via barycentric projection.
+        log(f'Rasterizing {n_polys} polygons onto grid...')
+        yield (f'Rasterizing polygons onto voxel grid...', 5)
         t_occ = time.time()
 
         occupied = set()
-        # Process polygons in chunks for progress yield
-        chunk = max(10000, n_polys // 40)
+        chunk = max(5000, n_polys // 40)
         for chunk_start in range(0, n_polys, chunk):
             chunk_end = min(chunk_start + chunk, n_polys)
             for pi in range(chunk_start, chunk_end):
                 poly = mesh.polygons[pi]
-                li = poly.loop_indices
                 ln = poly.loop_total
                 if ln < 3:
                     continue
-                # World-space triangle fan from vertex 0
-                v0_idx = poly.vertices[0]
-                v0 = verts_world[v0_idx]
+                v0 = verts_world[poly.vertices[0]]
                 for ti in range(1, ln - 1):
                     v1 = verts_world[poly.vertices[ti]]
                     v2 = verts_world[poly.vertices[ti + 1]]
-                    for (a, b, c) in bary:
-                        sx = a * v0[0] + b * v1[0] + c * v2[0]
-                        sy = a * v0[1] + b * v1[1] + c * v2[1]
-                        sz = a * v0[2] + b * v1[2] + c * v2[2]
-                        ix = int((sx - bbox_min[0]) / cell_size)
-                        iy = int((sy - bbox_min[1]) / cell_size)
-                        iz = int((sz - bbox_min[2]) / cell_size)
-                        if 0 <= ix < grid_size_x and 0 <= iy < grid_size_y and 0 <= iz < grid_size_z:
-                            occupied.add((ix, iy, iz))
-            pct = 5 + int(10 * chunk_end / n_polys)
-            yield (f'Sampling {chunk_end}/{n_polys} polys, {len(occupied)} cells occupied', pct)
+                    # Triangle AABB in voxel indices
+                    tri_min = np.minimum(np.minimum(v0, v1), v2)
+                    tri_max = np.maximum(np.maximum(v0, v1), v2)
+                    ix0 = max(0, int((tri_min[0] - bbox_min[0]) / cell_size))
+                    iy0 = max(0, int((tri_min[1] - bbox_min[1]) / cell_size))
+                    iz0 = max(0, int((tri_min[2] - bbox_min[2]) / cell_size))
+                    ix1 = min(grid_size_x - 1, int((tri_max[0] - bbox_min[0]) / cell_size))
+                    iy1 = min(grid_size_y - 1, int((tri_max[1] - bbox_min[1]) / cell_size))
+                    iz1 = min(grid_size_z - 1, int((tri_max[2] - bbox_min[2]) / cell_size))
+                    # Precompute triangle edges for barycentric test
+                    e0 = v1 - v0; e1 = v2 - v0
+                    d00 = float(np.dot(e0, e0)); d01 = float(np.dot(e0, e1))
+                    d11 = float(np.dot(e1, e1))
+                    denom = d00 * d11 - d01 * d01
+                    if denom < 1e-20:
+                        continue
+                    inv_denom = 1.0 / denom
+                    for ix in range(ix0, ix1 + 1):
+                        for iy in range(iy0, iy1 + 1):
+                            for iz in range(iz0, iz1 + 1):
+                                key = (ix, iy, iz)
+                                if key in occupied:
+                                    continue
+                                cx = bbox_min[0] + (ix + 0.5) * cell_size
+                                cy = bbox_min[1] + (iy + 0.5) * cell_size
+                                cz = bbox_min[2] + (iz + 0.5) * cell_size
+                                ep = np.array([cx, cy, cz], dtype=np.float32) - v0
+                                dp0 = float(np.dot(ep, e0)); dp1 = float(np.dot(ep, e1))
+                                v = (d11 * dp0 - d01 * dp1) * inv_denom
+                                w = (d00 * dp1 - d01 * dp0) * inv_denom
+                                u = 1.0 - v - w
+                                if u >= -0.001 and v >= -0.001 and w >= -0.001:
+                                    occupied.add(key)
+            pct = 5 + int(8 * chunk_end / n_polys)
+            elapsed = time.time() - t_occ
+            eta_str = ''
+            if chunk_end > 0 and chunk_end < n_polys:
+                eta = elapsed * (n_polys - chunk_end) / chunk_end
+                eta_str = f' ETA {eta:.0f}s'
+            yield (f'Rasterizing {chunk_end}/{n_polys} polys, {len(occupied)} cells{eta_str}', pct)
 
-        log(f'Occupancy: {len(occupied)} / {total_cells} cells ({100*len(occupied)/max(total_cells,1):.1f}%), sampled in {time.time() - t_occ:.1f}s')
-        yield (f'{len(occupied)} occupied voxels in {time.time() - t_occ:.1f}s', 17)
+        log(f'Surface occupancy: {len(occupied)} cells, in {time.time() - t_occ:.1f}s')
+        yield (f'{len(occupied)} surface cells in {time.time() - t_occ:.1f}s', 17)
 
         # Phase 4: Surface face extraction - keep face only if neighbor is empty
         yield ('Extracting surface faces...', 17)
