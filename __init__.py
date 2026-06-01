@@ -3845,69 +3845,73 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
 
         yield (f'Grid: {grid_size_x}×{grid_size_y}×{grid_size_z} = {total_cells} cells', 3)
 
-        # Rasterize each polygon's surface onto the voxel grid.
-        # For each triangle (fan from vertex 0), walk its AABB in voxel coords
-        # and test each voxel center against the triangle via barycentric projection.
-        log(f'Rasterizing {n_polys} polygons onto grid...')
-        yield (f'Rasterizing polygons onto voxel grid...', 5)
+        # Phase 3: Voxel occupancy via vertex seeding + BVH verification
+        # 1. Seed cells from every mesh vertex (guaranteed occupied)
+        # 2. 2-ring expand to get surface band
+        # 3. BVH find_nearest per band cell to verify surface proximity
+        half_diag = cell_size * math.sqrt(3) * 0.5
+        log(f'Voxel grid: half_diag={half_diag*1000:.2f}mm')
+        yield ('Seeding cells from mesh vertices...', 5)
         t_occ = time.time()
 
         occupied = set()
-        chunk = max(5000, n_polys // 40)
-        for chunk_start in range(0, n_polys, chunk):
-            chunk_end = min(chunk_start + chunk, n_polys)
-            for pi in range(chunk_start, chunk_end):
-                poly = mesh.polygons[pi]
-                ln = poly.loop_total
-                if ln < 3:
-                    continue
-                v0 = verts_world[poly.vertices[0]]
-                for ti in range(1, ln - 1):
-                    v1 = verts_world[poly.vertices[ti]]
-                    v2 = verts_world[poly.vertices[ti + 1]]
-                    # Triangle AABB in voxel indices
-                    tri_min = np.minimum(np.minimum(v0, v1), v2)
-                    tri_max = np.maximum(np.maximum(v0, v1), v2)
-                    ix0 = max(0, int((tri_min[0] - bbox_min[0]) / cell_size))
-                    iy0 = max(0, int((tri_min[1] - bbox_min[1]) / cell_size))
-                    iz0 = max(0, int((tri_min[2] - bbox_min[2]) / cell_size))
-                    ix1 = min(grid_size_x - 1, int((tri_max[0] - bbox_min[0]) / cell_size))
-                    iy1 = min(grid_size_y - 1, int((tri_max[1] - bbox_min[1]) / cell_size))
-                    iz1 = min(grid_size_z - 1, int((tri_max[2] - bbox_min[2]) / cell_size))
-                    # Precompute triangle edges for barycentric test
-                    e0 = v1 - v0; e1 = v2 - v0
-                    d00 = float(np.dot(e0, e0)); d01 = float(np.dot(e0, e1))
-                    d11 = float(np.dot(e1, e1))
-                    denom = d00 * d11 - d01 * d01
-                    if denom < 1e-20:
-                        continue
-                    inv_denom = 1.0 / denom
-                    for ix in range(ix0, ix1 + 1):
-                        for iy in range(iy0, iy1 + 1):
-                            for iz in range(iz0, iz1 + 1):
-                                key = (ix, iy, iz)
-                                if key in occupied:
-                                    continue
-                                cx = bbox_min[0] + (ix + 0.5) * cell_size
-                                cy = bbox_min[1] + (iy + 0.5) * cell_size
-                                cz = bbox_min[2] + (iz + 0.5) * cell_size
-                                ep = np.array([cx, cy, cz], dtype=np.float32) - v0
-                                dp0 = float(np.dot(ep, e0)); dp1 = float(np.dot(ep, e1))
-                                v = (d11 * dp0 - d01 * dp1) * inv_denom
-                                w = (d00 * dp1 - d01 * dp0) * inv_denom
-                                u = 1.0 - v - w
-                                if u >= -0.001 and v >= -0.001 and w >= -0.001:
-                                    occupied.add(key)
-            pct = 5 + int(8 * chunk_end / n_polys)
-            elapsed = time.time() - t_occ
-            eta_str = ''
-            if chunk_end > 0 and chunk_end < n_polys:
-                eta = elapsed * (n_polys - chunk_end) / chunk_end
-                eta_str = f' ETA {eta:.0f}s'
-            yield (f'Rasterizing {chunk_end}/{n_polys} polys, {len(occupied)} cells{eta_str}', pct)
+        # Step 1: vertex seeding
+        for vi in range(n_verts):
+            v = verts_world[vi]
+            ix = int((v[0] - bbox_min[0]) / cell_size)
+            iy = int((v[1] - bbox_min[1]) / cell_size)
+            iz = int((v[2] - bbox_min[2]) / cell_size)
+            if 0 <= ix < grid_size_x and 0 <= iy < grid_size_y and 0 <= iz < grid_size_z:
+                occupied.add((ix, iy, iz))
+        log(f'Vertex seeds: {len(occupied)} cells, in {time.time() - t_occ:.1f}s')
+        yield (f'{len(occupied)} vertex cells', 8)
 
-        log(f'Surface occupancy: {len(occupied)} cells, in {time.time() - t_occ:.1f}s')
-        yield (f'{len(occupied)} surface cells in {time.time() - t_occ:.1f}s', 17)
+        # Step 2: 1-ring expand
+        seeds = list(occupied)
+        for (ix, iy, iz) in seeds:
+            for dx, dy, dz in DIRS:
+                nx, ny, nz = ix + dx, iy + dy, iz + dz
+                if 0 <= nx < grid_size_x and 0 <= ny < grid_size_y and 0 <= nz < grid_size_z:
+                    occupied.add((nx, ny, nz))
+        band1 = list(occupied - set(seeds))
+        log(f'1-ring expand: {len(occupied)} cells')
+        yield (f'{len(occupied)} cells after 1-ring expand', 10)
+
+        # Step 3: 2-ring expand (candidates for BVH check)
+        candidates = set()
+        for (ix, iy, iz) in band1:
+            for dx, dy, dz in DIRS:
+                nx, ny, nz = ix + dx, iy + dy, iz + dz
+                if 0 <= nx < grid_size_x and 0 <= ny < grid_size_y and 0 <= nz < grid_size_z:
+                    nk = (nx, ny, nz)
+                    if nk not in occupied:
+                        candidates.add(nk)
+        log(f'2-ring candidates: {len(candidates)} cells')
+        yield (f'{len(candidates)} BVH candidates', 12)
+
+        # Step 4: BVH verify each candidate
+        verified = 0
+        rejected = 0
+        cand_list = list(candidates)
+        chunk = 10000
+        for ci, start in enumerate(range(0, len(cand_list), chunk)):
+            end = min(start + chunk, len(cand_list))
+            for i in range(start, end):
+                ix, iy, iz = cand_list[i]
+                cx = bbox_min[0] + (ix + 0.5) * cell_size
+                cy = bbox_min[1] + (iy + 0.5) * cell_size
+                cz = bbox_min[2] + (iz + 0.5) * cell_size
+                nearest = bvh.find_nearest(mathutils.Vector((cx, cy, cz)))
+                if nearest is not None and nearest[3] < half_diag:
+                    occupied.add((ix, iy, iz))
+                    verified += 1
+                else:
+                    rejected += 1
+            pct = 12 + int(5 * (ci + 1) / max(1, (len(cand_list) + chunk - 1) // chunk))
+            yield (f'BVH verifying {end}/{len(cand_list)} (+{verified}/-{rejected})', pct)
+
+        log(f'BVH verified: +{verified} -{rejected}, total occupied={len(occupied)} in {time.time() - t_occ:.1f}s')
+        yield (f'{len(occupied)} occupied cells (+{verified} BVH verified)', 17)
 
         # Phase 4: Surface face extraction - keep face only if neighbor is empty
         yield ('Extracting surface faces...', 17)
