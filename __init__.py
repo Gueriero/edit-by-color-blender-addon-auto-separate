@@ -3621,9 +3621,9 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     cell_size_mm: bpy.props.FloatProperty(
-        name='Block Size', default=5.0, min=0.5, max=100.0,
+        name='Block Size (mm)', default=5.0, min=0.5, max=100.0,
         description='Size of each block/cube in millimeters. Smaller = finer blocks, more geometry',
-        unit='LENGTH', precision=1, step=100,
+        precision=1, step=10,
     )
     samples_per_face: bpy.props.IntProperty(
         name='Samples per Face', default=4, min=1, max=64,
