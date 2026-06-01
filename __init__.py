@@ -3913,8 +3913,32 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         log(f'BVH verified: +{verified} -{rejected}, total occupied={len(occupied)} in {time.time() - t_occ:.1f}s')
         yield (f'{len(occupied)} occupied cells (+{verified} BVH verified)', 17)
 
+        # Phase 3b: Cull inside-facing cells. Keep only cells on the OUTSIDE
+        # of the mesh surface (like Blender Remesh Blocks exterior shell).
+        yield ('Culling interior cells...', 18)
+        t_cull = time.time()
+        inside = []
+        occ_list = list(occupied)
+        for i, (ix, iy, iz) in enumerate(occ_list):
+            cx = bbox_min[0] + (ix + 0.5) * cell_size
+            cy = bbox_min[1] + (iy + 0.5) * cell_size
+            cz = bbox_min[2] + (iz + 0.5) * cell_size
+            nearest = bvh.find_nearest(mathutils.Vector((cx, cy, cz)))
+            if nearest is not None:
+                hit_loc, hit_norm, _, _ = nearest
+                # cell_center to surface: positive = outside (same dir as normal)
+                to_cell = mathutils.Vector((cx - hit_loc[0], cy - hit_loc[1], cz - hit_loc[2]))
+                if to_cell.dot(hit_norm) < 0:
+                    inside.append((ix, iy, iz))
+            if i % 10000 == 0 and i > 0:
+                yield (f'Culling {i}/{len(occ_list)}...', 18)
+        for k in inside:
+            occupied.discard(k)
+        log(f'Culled {len(inside)} interior cells, {len(occupied)} exterior remain, in {time.time() - t_cull:.1f}s')
+        yield (f'{len(occupied)} exterior cells (culled {len(inside)} interior)', 20)
+
         # Phase 4: Surface face extraction - keep face only if neighbor is empty
-        yield ('Extracting surface faces...', 17)
+        yield ('Extracting surface faces...', 22)
         t_faces = time.time()
         # For each face, we store: (ix, iy, iz, dir_idx)
         faces_to_emit = []
@@ -3924,10 +3948,10 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                 if neighbor not in occupied:
                     faces_to_emit.append((ix, iy, iz, di))
         log(f'Surface faces: {len(faces_to_emit)} (culled from {len(occupied) * 6} potential) in {time.time() - t_faces:.1f}s')
-        yield (f'{len(faces_to_emit)} surface faces', 20)
+        yield (f'{len(faces_to_emit)} surface faces', 25)
 
         # Phase 5: Color sampling per face via BVHTree -> UV -> texture
-        yield ('Sampling texture color per face...', 22)
+        yield ('Sampling texture color per face...', 27)
         t_color = time.time()
         uv_layer = mesh.uv_layers[uv_name].data
         face_colors = np.zeros((len(faces_to_emit), 3), dtype=np.float32)
