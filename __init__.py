@@ -3913,29 +3913,30 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         log(f'BVH verified: +{verified} -{rejected}, total occupied={len(occupied)} in {time.time() - t_occ:.1f}s')
         yield (f'{len(occupied)} occupied cells (+{verified} BVH verified)', 17)
 
-        # Phase 3b: Cull inside-facing cells. Keep only cells on the OUTSIDE
-        # of the mesh surface (like Blender Remesh Blocks exterior shell).
-        yield ('Culling interior cells...', 18)
-        t_cull = time.time()
-        inside = []
-        occ_list = list(occupied)
-        for i, (ix, iy, iz) in enumerate(occ_list):
-            cx = bbox_min[0] + (ix + 0.5) * cell_size
-            cy = bbox_min[1] + (iy + 0.5) * cell_size
-            cz = bbox_min[2] + (iz + 0.5) * cell_size
-            nearest = bvh.find_nearest(mathutils.Vector((cx, cy, cz)))
-            if nearest is not None:
-                hit_loc, hit_norm, _, _ = nearest
-                # cell_center to surface: positive = outside (same dir as normal)
-                to_cell = mathutils.Vector((cx - hit_loc[0], cy - hit_loc[1], cz - hit_loc[2]))
-                if to_cell.dot(hit_norm) < 0:
-                    inside.append((ix, iy, iz))
-            if i % 10000 == 0 and i > 0:
-                yield (f'Culling {i}/{len(occ_list)}...', 18)
-        for k in inside:
-            occupied.discard(k)
-        log(f'Culled {len(inside)} interior cells, {len(occupied)} exterior remain, in {time.time() - t_cull:.1f}s')
-        yield (f'{len(occupied)} exterior cells (culled {len(inside)} interior)', 20)
+        # Phase 3b: Interior fill via scanline parity along Y axis.
+        # Contiguous occupied blocks = single surface crossing (like Blender Remesh).
+        yield ('Filling interior via scanline...', 18)
+        t_fill = time.time()
+        n_filled = 0
+        for ix in range(grid_size_x):
+            for iz in range(grid_size_z):
+                inside = False
+                iy = 0
+                while iy < grid_size_y:
+                    if (ix, iy, iz) in occupied:
+                        # Skip contiguous occupied block — single crossing
+                        while iy < grid_size_y and (ix, iy, iz) in occupied:
+                            iy += 1
+                        inside = not inside
+                    else:
+                        if inside:
+                            occupied.add((ix, iy, iz))
+                            n_filled += 1
+                        iy += 1
+            if ix % 50 == 0:
+                yield (f'Filling column {ix}/{grid_size_x} (+{n_filled} cells)...', 18)
+        log(f'Interior fill: +{n_filled} cells, total {len(occupied)} occupied, in {time.time() - t_fill:.1f}s')
+        yield (f'{len(occupied)} total cells (+{n_filled} interior filled)', 20)
 
         # Phase 4: Surface face extraction - keep face only if neighbor is empty
         yield ('Extracting surface faces...', 22)
