@@ -3612,6 +3612,42 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         col.prop(self, 'kmeans_subsample')
 
 
+class SNA_OT_voxel_block_remesh(bpy.types.Operator):
+    bl_idname = 'sna.voxel_block_remesh'
+    bl_label = 'Voxel Block Remesh'
+    bl_description = 'Octree voxel remesh: convert textured mesh into colored blocks (Minecraft-style). Each occupied voxel becomes a cube face, colored by texture sampling, then quantized into K palette colors via k-means'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    octree_depth: bpy.props.IntProperty(
+        name='Octree Depth', default=6, min=3, max=10,
+        description='2^depth voxels per axis. Higher = finer blocks. Depth 6 = 64³ voxels',
+    )
+    num_colors: bpy.props.IntProperty(
+        name='Total Colors', default=16, min=2, max=256,
+        description='Number of palette colors (K for k-means). Each color becomes one material',
+    )
+    kmeans_iters: bpy.props.IntProperty(
+        name='K-means Iterations', default=20, min=2, max=100,
+    )
+    kmeans_subsample: bpy.props.IntProperty(
+        name='K-means Sample Cap', default=20000, min=500, max=200000,
+        description='Cap face-color samples for k-means clustering to keep it fast',
+    )
+    use_hsv: bpy.props.BoolProperty(
+        name='Cluster in HSV', default=True,
+        description='K-means in HSV space (better perceptual grouping). Off = RGB',
+    )
+    do_separate: bpy.props.BoolProperty(
+        name='Separate by Color', default=True,
+        description='Separate the result into one mesh object per material/color',
+    )
+    remove_original: bpy.props.BoolProperty(
+        name='Remove Original', default=False,
+        description='Remove the source mesh object after the remesh is built',
+    )
+
+    _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
 class SNA_OT_test_progressive_separate(bpy.types.Operator):
     bl_idname = 'sna.test_progressive_separate'
     bl_label = 'Self-Test: Progressive Separate'
