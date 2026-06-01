@@ -3811,7 +3811,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         loop_verts = np.empty(len(mesh.loops), dtype=np.int32)
         mesh.loops.foreach_get('vertex_index', loop_verts)
 
-        # Build mapping: BVH face index -> original polygon index
+        # Build mapping: BVH face index -> (original polygon index, sub-triangle index)
         bvh_face_to_poly = []
         for pi in range(n_polys):
             s = int(poly_loop_start[pi]); t = int(poly_loop_total[pi])
@@ -3819,7 +3819,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             # Triangulate n-gon for BVH
             for ti in range(1, t - 1):
                 polys_list.append((vs[0], vs[ti], vs[ti + 1]))
-                bvh_face_to_poly.append(pi)
+                bvh_face_to_poly.append((pi, ti))
 
         bvh = mathutils.bvhtree.BVHTree.FromPolygons(verts_list, polys_list)
         log(f'BVHTree built ({len(polys_list)} tris) in {time.time() - t_bvh:.1f}s')
@@ -3903,6 +3903,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         t_color = time.time()
         uv_layer = mesh.uv_layers[uv_name].data
         face_colors = np.zeros((len(faces_to_emit), 3), dtype=np.float32)
+        M_inv = np.array(obj.matrix_world.inverted(), dtype=np.float32)
 
         for fi, (ix, iy, iz, di) in enumerate(faces_to_emit):
             # Voxel center
@@ -3918,8 +3919,8 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                 continue
             hit_loc, hit_norm, bvh_face_idx, dist = nearest
 
-            # Get original polygon index
-            poly_idx = bvh_face_to_poly[bvh_face_idx]
+            # Get original polygon index + sub-triangle
+            poly_idx, sub_ti = bvh_face_to_poly[bvh_face_idx]
             poly = mesh.polygons[poly_idx]
             li = poly.loop_indices
             ln = poly.loop_total
@@ -3928,17 +3929,17 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                 continue
 
             # Barycentric interpolation of UV at hit_location
+            # Use the correct sub-triangle from BVH triangulation
             uv0 = uv_layer[li[0]].uv
-            uv1 = uv_layer[li[1]].uv
-            uv2 = uv_layer[li[2]].uv
+            uv1 = uv_layer[li[sub_ti]].uv
+            uv2 = uv_layer[li[sub_ti + 1]].uv
 
             # Transform hit to local space for barycentric computation
-            M_inv = np.array(obj.matrix_world.inverted(), dtype=np.float32)
             hit_local_pt = M_inv[:3, :3] @ np.array(hit_loc, dtype=np.float32) + M_inv[:3, 3]
 
             v0_local = verts_local[poly.vertices[0]]
-            v1_local = verts_local[poly.vertices[1]]
-            v2_local = verts_local[poly.vertices[2]]
+            v1_local = verts_local[poly.vertices[sub_ti]]
+            v2_local = verts_local[poly.vertices[sub_ti + 1]]
 
             # Barycentric weights in 3D space
             e0 = v1_local - v0_local
