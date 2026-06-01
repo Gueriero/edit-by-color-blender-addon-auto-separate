@@ -3984,6 +3984,216 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         log(f'Color sampling done in {time.time() - t_color:.1f}s')
         yield (f'Colors sampled ({len(faces_to_emit)} faces)', 40)
 
+        # Phase 6: K-means palette
+        K = self.num_colors
+        log(f'K-means: K={K}, iters={self.kmeans_iters}, cap={self.kmeans_subsample}')
+        yield (f'K-means palette K={K}...', 42)
+
+        t_km = time.time()
+        if self.use_hsv:
+            cluster_data = _sna_rgb_to_hsv_np(face_colors)
+            # Circular hue encoding
+            hx = np.cos(cluster_data[:, 0] * 2.0 * math.pi) * cluster_data[:, 1]
+            hy = np.sin(cluster_data[:, 0] * 2.0 * math.pi) * cluster_data[:, 1]
+            cluster_data = np.stack([hx, hy, cluster_data[:, 2]], axis=1)
+        else:
+            cluster_data = face_colors.copy()
+
+        N = cluster_data.shape[0]
+        cap = min(N, max(K * 50, self.kmeans_subsample))
+        if N > cap:
+            idx = np.random.choice(N, cap, replace=False)
+            sample = cluster_data[idx]
+        else:
+            sample = cluster_data
+
+        rng = np.random.default_rng(42)
+        first = rng.integers(0, sample.shape[0])
+        centers = [sample[first]]
+        dist_sq = np.full(sample.shape[0], np.inf)
+        for _ in range(K - 1):
+            diff = sample - centers[-1]
+            d2 = np.sum(diff * diff, axis=1)
+            dist_sq = np.minimum(dist_sq, d2)
+            probs = dist_sq / max(dist_sq.sum(), 1e-12)
+            nxt = rng.choice(sample.shape[0], p=probs)
+            centers.append(sample[nxt])
+        centers = np.stack(centers, axis=0)
+
+        for it in range(self.kmeans_iters):
+            d2 = np.sum((sample[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+            labels = np.argmin(d2, axis=1)
+            new_centers = np.zeros_like(centers)
+            for c in range(K):
+                mask = labels == c
+                if mask.any():
+                    new_centers[c] = sample[mask].mean(axis=0)
+                else:
+                    new_centers[c] = centers[c]
+            shift = float(np.linalg.norm(new_centers - centers))
+            centers = new_centers
+            pct = 42 + int(6 * (it + 1) / self.kmeans_iters)
+            yield (f'K-means {it+1}/{self.kmeans_iters} (shift={shift:.4f})', pct)
+            if shift < 1e-5:
+                log(f'  converged early at iter {it+1}')
+                break
+        log(f'K-means done in {time.time() - t_km:.1f}s')
+
+        # Phase 7: Assign each face to nearest cluster center
+        yield ('Assigning faces to palette...', 50)
+        t_assign = time.time()
+        face_labels = np.empty(cluster_data.shape[0], dtype=np.int32)
+        chunk = 50000
+        total_chunks = (cluster_data.shape[0] + chunk - 1) // chunk
+        for ci, start in enumerate(range(0, cluster_data.shape[0], chunk)):
+            end = min(start + chunk, cluster_data.shape[0])
+            seg = cluster_data[start:end]
+            d2_seg = np.sum((seg[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+            face_labels[start:end] = np.argmin(d2_seg, axis=1)
+            pct = 50 + int(5 * (ci + 1) / total_chunks)
+            yield (f'Assigning {ci+1}/{total_chunks}...', pct)
+        log(f'Assignment done in {time.time() - t_assign:.1f}s')
+
+        # Phase 8: Create materials (one per non-empty cluster)
+        yield ('Creating materials...', 56)
+        if self.use_hsv:
+            # centers are in (hx, hy, V) space — recover approximate RGB
+            h_recovered = (np.arctan2(centers[:, 1], centers[:, 0]) / (2.0 * math.pi)) % 1.0
+            s_recovered = np.sqrt(centers[:, 0]**2 + centers[:, 1]**2)
+            s_recovered = np.clip(s_recovered, 0.0, 1.0)
+            v_recovered = centers[:, 2]
+            cluster_rgb = np.zeros((K, 3), dtype=np.float32)
+            import colorsys
+            for c in range(K):
+                r, g, b = colorsys.hsv_to_rgb(float(h_recovered[c]), float(s_recovered[c]), float(v_recovered[c]))
+                cluster_rgb[c] = (r, g, b)
+        else:
+            cluster_rgb = centers.copy()
+
+        slot_map = {}
+        for c in range(K):
+            if not (face_labels == c).any():
+                continue
+            r, g, b = float(cluster_rgb[c, 0]), float(cluster_rgb[c, 1]), float(cluster_rgb[c, 2])
+            mat_name = f'EBC_Voxel_{c:03d}'
+            mat = bpy.data.materials.get(mat_name)
+            if mat is None:
+                mat = bpy.data.materials.new(mat_name)
+                mat.use_nodes = True
+            if mat.use_nodes and mat.node_tree:
+                for nd in mat.node_tree.nodes:
+                    if nd.type == 'BSDF_PRINCIPLED':
+                        nd.inputs['Base Color'].default_value = (r, g, b, 1.0); break
+            mat.diffuse_color = (r, g, b, 1.0)
+            slot_idx = -1
+            for si, s in enumerate(obj.material_slots):
+                if s.material and s.material.name == mat.name:
+                    slot_idx = si; break
+            if slot_idx < 0:
+                obj.data.materials.append(mat)
+                slot_idx = len(obj.material_slots) - 1
+            slot_map[c] = slot_idx
+        log(f'Materials: {len(slot_map)} non-empty clusters')
+        yield (f'{len(slot_map)} materials created', 60)
+
+        # Phase 9: Build output geometry via bmesh
+        yield ('Building block geometry...', 62)
+        t_geo = time.time()
+        import bmesh
+
+        # Create new mesh object for the result
+        result_mesh = bpy.data.meshes.new(obj.name + '_Voxel')
+        result_obj = bpy.data.objects.new(obj.name + '_Voxel', result_mesh)
+        context.collection.objects.link(result_obj)
+        result_obj.matrix_world = mathutils.Matrix.Identity(4)
+
+        bm = bmesh.new()
+        # Copy materials to result object slots
+        result_slot_map = {}
+        for c in slot_map:
+            mat_name = f'EBC_Voxel_{c:03d}'
+            mat = bpy.data.materials.get(mat_name)
+            if mat is None:
+                continue
+            # Check if already in result object slots
+            found = -1
+            for si, s in enumerate(result_obj.material_slots):
+                if s.material and s.material.name == mat.name:
+                    found = si; break
+            if found < 0:
+                result_obj.data.materials.append(mat)
+                found = len(result_obj.material_slots) - 1
+            result_slot_map[c] = found
+
+        def get_face_corners(ix, iy, iz, di):
+            """Return 4 world-space corner positions of the face (quad, counter-clockwise from outside)."""
+            dx, dy, dz = DIRS[di]
+            # Cell min corner
+            x0 = bbox_min[0] + ix * cell_size
+            y0 = bbox_min[1] + iy * cell_size
+            z0 = bbox_min[2] + iz * cell_size
+            x1 = x0 + cell_size
+            y1 = y0 + cell_size
+            z1 = z0 + cell_size
+            if di == 0:  # +X
+                return [(x1,y0,z0), (x1,y1,z0), (x1,y1,z1), (x1,y0,z1)]
+            elif di == 1:  # -X
+                return [(x0,y0,z0), (x0,y0,z1), (x0,y1,z1), (x0,y1,z0)]
+            elif di == 2:  # +Y
+                return [(x0,y1,z0), (x0,y1,z1), (x1,y1,z1), (x1,y1,z0)]
+            elif di == 3:  # -Y
+                return [(x0,y0,z0), (x1,y0,z0), (x1,y0,z1), (x0,y0,z1)]
+            elif di == 4:  # +Z
+                return [(x0,y0,z1), (x1,y0,z1), (x1,y1,z1), (x0,y1,z1)]
+            else:  # -Z
+                return [(x0,y1,z0), (x1,y1,z0), (x1,y0,z0), (x0,y0,z0)]
+
+        for fi, (ix, iy, iz, di) in enumerate(faces_to_emit):
+            cluster = face_labels[fi]
+            if cluster not in result_slot_map:
+                continue  # empty cluster, skip
+            corners = get_face_corners(ix, iy, iz, di)
+            verts = [bm.verts.new(c) for c in corners]
+            bm.verts.ensure_lookup_table()
+            face = bm.faces.new(reversed(verts))  # reversed for outward normal
+            face.material_index = result_slot_map[cluster]
+
+            if fi % 10000 == 0 and fi > 0:
+                pct = 62 + int(26 * fi / len(faces_to_emit))
+                yield (f'Building geometry {fi}/{len(faces_to_emit)}...', pct)
+
+        bm.to_mesh(result_mesh)
+        bm.free()
+        result_mesh.update()
+        log(f'Geometry built ({len(faces_to_emit)} faces) in {time.time() - t_geo:.1f}s')
+        yield (f'Geometry built: {len(faces_to_emit)} faces', 90)
+
+        # Phase 10: Separate by material (optional) and cleanup
+        if self.do_separate:
+            log('Separating by material...')
+            yield ('Separating by material...', 92)
+            t_sep = time.time()
+            bpy.ops.object.select_all(action='DESELECT')
+            result_obj.select_set(True)
+            context.view_layer.objects.active = result_obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            try:
+                bpy.ops.mesh.separate(type='MATERIAL')
+            except RuntimeError as e:
+                log(f'Separate warning: {e}')
+            bpy.ops.object.mode_set(mode='OBJECT')
+            log(f'Separation done in {time.time() - t_sep:.1f}s')
+
+        if self.remove_original:
+            log(f'Removing original object {obj.name}')
+            bpy.data.objects.remove(obj, do_unlink=True)
+            yield ('Original removed', 98)
+
+        elapsed = time.time() - t_start
+        log(f'=== Voxel Block Remesh finished in {elapsed:.1f}s ===')
+        yield (f'Done in {elapsed:.0f}s — {len(slot_map)} colors', 100)
+
 class SNA_OT_test_progressive_separate(bpy.types.Operator):
     bl_idname = 'sna.test_progressive_separate'
     bl_label = 'Self-Test: Progressive Separate'
