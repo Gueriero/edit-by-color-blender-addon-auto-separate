@@ -4056,19 +4056,12 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
 
         # Phase 8: Create materials (one per non-empty cluster)
         yield ('Creating materials...', 56)
-        if self.use_hsv:
-            # centers are in (hx, hy, V) space — recover approximate RGB
-            h_recovered = (np.arctan2(centers[:, 1], centers[:, 0]) / (2.0 * math.pi)) % 1.0
-            s_recovered = np.sqrt(centers[:, 0]**2 + centers[:, 1]**2)
-            s_recovered = np.clip(s_recovered, 0.0, 1.0)
-            v_recovered = centers[:, 2]
-            cluster_rgb = np.zeros((K, 3), dtype=np.float32)
-            import colorsys
-            for c in range(K):
-                r, g, b = colorsys.hsv_to_rgb(float(h_recovered[c]), float(s_recovered[c]), float(v_recovered[c]))
-                cluster_rgb[c] = (r, g, b)
-        else:
-            cluster_rgb = centers.copy()
+        # Compute per-cluster mean RGB from original face colors (like Auto Palette Split)
+        cluster_rgb = np.zeros((K, 3), dtype=np.float32)
+        for c in range(K):
+            mask = face_labels == c
+            if mask.any():
+                cluster_rgb[c] = face_colors[mask].mean(axis=0)
 
         slot_map = {}
         for c in range(K):
@@ -4155,7 +4148,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             corners = get_face_corners(ix, iy, iz, di)
             verts = [bm.verts.new(c) for c in corners]
             bm.verts.ensure_lookup_table()
-            face = bm.faces.new(reversed(verts))  # reversed for outward normal
+            face = bm.faces.new(verts)  # corners already CCW from outside
             face.material_index = result_slot_map[cluster]
 
             if fi % 10000 == 0 and fi > 0:
@@ -4166,7 +4159,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         bm.free()
         result_mesh.update()
         log(f'Geometry built ({len(faces_to_emit)} faces) in {time.time() - t_geo:.1f}s')
-        yield (f'Geometry built: {len(faces_to_emit)} faces', 90)
+        yield (f'Geometry built: {len(faces_to_emit)} faces', 88)
 
         # Phase 10: Separate by material (optional) and cleanup
         if self.do_separate:
