@@ -3620,9 +3620,14 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
     bl_description = 'Octree voxel remesh: convert textured mesh into colored blocks (Minecraft-style). Each occupied voxel becomes a cube face, colored by texture sampling, then quantized into K palette colors via k-means'
     bl_options = {'REGISTER', 'UNDO'}
 
-    octree_depth: bpy.props.IntProperty(
-        name='Octree Depth', default=6, min=3, max=10,
-        description='2^depth voxels per axis. Higher = finer blocks. Depth 6 = 64³ voxels',
+    cell_size_mm: bpy.props.FloatProperty(
+        name='Block Size', default=5.0, min=0.5, max=100.0,
+        description='Size of each block/cube in millimeters. Smaller = finer blocks, more geometry',
+        unit='LENGTH', precision=1, step=100,
+    )
+    samples_per_face: bpy.props.IntProperty(
+        name='Samples per Face', default=4, min=1, max=64,
+        description='Barycentric surface samples per polygon for voxel occupancy detection',
     )
     num_colors: bpy.props.IntProperty(
         name='Total Colors', default=16, min=2, max=256,
@@ -3751,7 +3756,8 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(self, 'octree_depth')
+        layout.prop(self, 'cell_size_mm')
+        layout.prop(self, 'samples_per_face')
         layout.prop(self, 'num_colors')
         layout.prop(self, 'use_hsv')
         layout.prop(self, 'do_separate')
@@ -3770,7 +3776,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             print(f'[VoxelRemesh] {msg}', flush=True)
 
         t_start = time.time()
-        log(f'=== Voxel Block Remesh: depth={self.octree_depth}, K={self.num_colors}, HSV={self.use_hsv} ===')
+        log(f'=== Voxel Block Remesh: cell={self.cell_size_mm:.1f}mm, K={self.num_colors}, HSV={self.use_hsv} ===')
 
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -3826,66 +3832,63 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         bvh = mathutils.bvhtree.BVHTree.FromPolygons(verts_list, polys_list)
         log(f'BVHTree built ({len(polys_list)} tris) in {time.time() - t_bvh:.1f}s')
 
-        # Phase 3: Voxel occupancy grid
-        depth = self.octree_depth
-        grid_size = 1 << depth  # 2^depth cells per axis
-        log(f'Voxel grid: {grid_size}³ = {grid_size**3} cells, depth={depth}')
+        # Phase 3: Voxel occupancy via surface sampling (fast)
+        cell_size = self.cell_size_mm / 1000.0  # mm → meters (Blender units)
+        log(f'Voxel grid: cell_size={self.cell_size_mm:.1f}mm ({cell_size:.4f}m)')
 
-        # Axis-aligned bounding box of mesh (world space)
-        bbox_min = np.min(verts_world, axis=0)
-        bbox_max = np.max(verts_world, axis=0)
-        # Pad by 1 cell on each side
-        cell_size = np.max(bbox_max - bbox_min) / grid_size
-        bbox_min -= cell_size
-        bbox_max += cell_size
-        # Re-normalize to exact cube grid
-        max_dim = np.max(bbox_max - bbox_min)
-        center = (bbox_min + bbox_max) / 2.0
-        half = max_dim / 2.0
-        bbox_min = center - half
-        bbox_max = center + half
-        cell_size = max_dim / grid_size
-        half_diag = cell_size * math.sqrt(3) * 0.5
-        log(f'Grid bbox: [{bbox_min}] -> [{bbox_max}], cell_size={cell_size*1000:.2f}mm')
+        # Axis-aligned bounding box with margin
+        bbox_min = np.min(verts_world, axis=0) - cell_size
+        bbox_max = np.max(verts_world, axis=0) + cell_size
+        # Snap to cell grid
+        grid_size_x = int(np.ceil((bbox_max[0] - bbox_min[0]) / cell_size))
+        grid_size_y = int(np.ceil((bbox_max[1] - bbox_min[1]) / cell_size))
+        grid_size_z = int(np.ceil((bbox_max[2] - bbox_min[2]) / cell_size))
+        bbox_max = bbox_min + np.array([grid_size_x, grid_size_y, grid_size_z], dtype=np.float32) * cell_size
+        total_cells = grid_size_x * grid_size_y * grid_size_z
+        log(f'Grid: {grid_size_x}×{grid_size_y}×{grid_size_z} = {total_cells} cells, bbox=[{bbox_min}] → [{bbox_max}]')
 
-        yield (f'Testing voxel occupancy ({grid_size}³)...', 5)
+        yield (f'Grid: {grid_size_x}×{grid_size_y}×{grid_size_z} = {total_cells} cells', 3)
+
+        # Sample mesh surface to find occupied voxels
+        samples = max(1, self.samples_per_face)
+        bary = _sna_make_bary_pts(samples)
+        n_bary = len(bary)
+        log(f'Sampling surface: {n_polys} polygons × {n_bary} samples = {n_polys * n_bary} total')
+
+        yield (f'Sampling surface ({n_polys} polys × {n_bary} samples)...', 5)
         t_occ = time.time()
 
-        # Use a dict/set for sparse storage - most cells in a 3D model are empty
         occupied = set()
-        # To find candidates: iterate over BVH faces, rasterize their AABB into voxels
-        for fi, tri_verts_idx in enumerate(polys_list):
-            v0 = verts_world[tri_verts_idx[0]]
-            v1 = verts_world[tri_verts_idx[1]]
-            v2 = verts_world[tri_verts_idx[2]]
-            tri_min = np.minimum(np.minimum(v0, v1), v2)
-            tri_max = np.maximum(np.maximum(v0, v1), v2)
-            ix0 = max(0, int((tri_min[0] - bbox_min[0]) / cell_size))
-            iy0 = max(0, int((tri_min[1] - bbox_min[1]) / cell_size))
-            iz0 = max(0, int((tri_min[2] - bbox_min[2]) / cell_size))
-            ix1 = min(grid_size - 1, int((tri_max[0] - bbox_min[0]) / cell_size) + 1)
-            iy1 = min(grid_size - 1, int((tri_max[1] - bbox_min[1]) / cell_size) + 1)
-            iz1 = min(grid_size - 1, int((tri_max[2] - bbox_min[2]) / cell_size) + 1)
-            for ix in range(ix0, ix1 + 1):
-                for iy in range(iy0, iy1 + 1):
-                    for iz in range(iz0, iz1 + 1):
-                        key = (ix, iy, iz)
-                        if key in occupied:
-                            continue
-                        cx = bbox_min[0] + (ix + 0.5) * cell_size
-                        cy = bbox_min[1] + (iy + 0.5) * cell_size
-                        cz = bbox_min[2] + (iz + 0.5) * cell_size
-                        cell_center = mathutils.Vector((cx, cy, cz))
-                        nearest = bvh.find_nearest(cell_center)
-                        if nearest is not None and nearest[3] < half_diag:
-                            occupied.add(key)
-            # Yield every 5000 faces
-            if fi % 5000 == 0:
-                pct = 5 + int(10 * fi / len(polys_list))
-                yield (f'Rasterizing faces {fi}/{len(polys_list)}...', pct)
+        # Process polygons in chunks for progress yield
+        chunk = max(10000, n_polys // 40)
+        for chunk_start in range(0, n_polys, chunk):
+            chunk_end = min(chunk_start + chunk, n_polys)
+            for pi in range(chunk_start, chunk_end):
+                poly = mesh.polygons[pi]
+                li = poly.loop_indices
+                ln = poly.loop_total
+                if ln < 3:
+                    continue
+                # World-space triangle fan from vertex 0
+                v0_idx = poly.vertices[0]
+                v0 = verts_world[v0_idx]
+                for ti in range(1, ln - 1):
+                    v1 = verts_world[poly.vertices[ti]]
+                    v2 = verts_world[poly.vertices[ti + 1]]
+                    for (a, b, c) in bary:
+                        sx = a * v0[0] + b * v1[0] + c * v2[0]
+                        sy = a * v0[1] + b * v1[1] + c * v2[1]
+                        sz = a * v0[2] + b * v1[2] + c * v2[2]
+                        ix = int((sx - bbox_min[0]) / cell_size)
+                        iy = int((sy - bbox_min[1]) / cell_size)
+                        iz = int((sz - bbox_min[2]) / cell_size)
+                        if 0 <= ix < grid_size_x and 0 <= iy < grid_size_y and 0 <= iz < grid_size_z:
+                            occupied.add((ix, iy, iz))
+            pct = 5 + int(10 * chunk_end / n_polys)
+            yield (f'Sampling {chunk_end}/{n_polys} polys, {len(occupied)} cells occupied', pct)
 
-        log(f'Occupancy: {len(occupied)} occupied voxels / {grid_size**3} total, in {time.time() - t_occ:.1f}s')
-        yield (f'{len(occupied)} occupied voxels found', 15)
+        log(f'Occupancy: {len(occupied)} / {total_cells} cells ({100*len(occupied)/max(total_cells,1):.1f}%), sampled in {time.time() - t_occ:.1f}s')
+        yield (f'{len(occupied)} occupied voxels in {time.time() - t_occ:.1f}s', 17)
 
         # Phase 4: Surface face extraction - keep face only if neighbor is empty
         yield ('Extracting surface faces...', 17)
