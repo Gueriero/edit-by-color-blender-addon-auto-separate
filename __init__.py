@@ -3759,6 +3759,230 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         col.prop(self, 'kmeans_iters')
         col.prop(self, 'kmeans_subsample')
 
+    def _work(self, context, obj, image, uv_name):
+        """Generator: yields ('text', pct 0..100). Core voxel remesh pipeline."""
+        import math, time
+        import numpy as np
+
+        def log(msg):
+            print(f'[VoxelRemesh] {msg}', flush=True)
+
+        t_start = time.time()
+        log(f'=== Voxel Block Remesh: depth={self.octree_depth}, K={self.num_colors}, HSV={self.use_hsv} ===')
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Face directions: +X, -X, +Y, -Y, +Z, -Z (constant across all phases)
+        DIRS = [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]
+
+        # Phase 1: Read image
+        w_img, h_img = image.size[0], image.size[1]
+        yield (f'Reading image {w_img}x{h_img}...', 0)
+        npx = np.empty(len(image.pixels), dtype=np.float32)
+        image.pixels.foreach_get(npx)
+        img = npx.reshape(h_img, w_img, 4)[:, :, :3]
+        log(f'Image read in {time.time() - t_start:.1f}s')
+
+        # Phase 2: Build BVHTree from world-space mesh
+        yield ('Building BVHTree...', 2)
+        t_bvh = time.time()
+        mesh = obj.data
+        n_verts = len(mesh.vertices)
+        n_polys = len(mesh.polygons)
+        if n_polys == 0:
+            raise RuntimeError('Mesh has no polygons')
+
+        # Collect world-space vertices
+        verts_local = np.empty(n_verts * 3, dtype=np.float32)
+        mesh.vertices.foreach_get('co', verts_local)
+        verts_local = verts_local.reshape(n_verts, 3)
+        M = np.array(obj.matrix_world, dtype=np.float32)
+        verts_world = verts_local @ M[:3, :3].T + M[:3, 3]
+
+        # Build BVHTree (needs Python list of coords + list of index-triplets)
+        import mathutils
+        verts_list = verts_world.tolist()
+        polys_list = []
+        poly_loop_start = np.empty(n_polys, dtype=np.int32)
+        poly_loop_total = np.empty(n_polys, dtype=np.int32)
+        mesh.polygons.foreach_get('loop_start', poly_loop_start)
+        mesh.polygons.foreach_get('loop_total', poly_loop_total)
+        loop_verts = np.empty(len(mesh.loops), dtype=np.int32)
+        mesh.loops.foreach_get('vertex_index', loop_verts)
+
+        # Build mapping: BVH face index -> original polygon index
+        bvh_face_to_poly = []
+        for pi in range(n_polys):
+            s = int(poly_loop_start[pi]); t = int(poly_loop_total[pi])
+            vs = loop_verts[s:s + t].tolist()
+            # Triangulate n-gon for BVH
+            for ti in range(1, t - 1):
+                polys_list.append((vs[0], vs[ti], vs[ti + 1]))
+                bvh_face_to_poly.append(pi)
+
+        bvh = mathutils.bvhtree.BVHTree.FromPolygons(verts_list, polys_list)
+        log(f'BVHTree built ({len(polys_list)} tris) in {time.time() - t_bvh:.1f}s')
+
+        # Phase 3: Voxel occupancy grid
+        depth = self.octree_depth
+        grid_size = 1 << depth  # 2^depth cells per axis
+        log(f'Voxel grid: {grid_size}³ = {grid_size**3} cells, depth={depth}')
+
+        # Axis-aligned bounding box of mesh (world space)
+        bbox_min = np.min(verts_world, axis=0)
+        bbox_max = np.max(verts_world, axis=0)
+        # Pad by 1 cell on each side
+        cell_size = np.max(bbox_max - bbox_min) / grid_size
+        bbox_min -= cell_size
+        bbox_max += cell_size
+        # Re-normalize to exact cube grid
+        max_dim = np.max(bbox_max - bbox_min)
+        center = (bbox_min + bbox_max) / 2.0
+        half = max_dim / 2.0
+        bbox_min = center - half
+        bbox_max = center + half
+        cell_size = max_dim / grid_size
+        half_diag = cell_size * math.sqrt(3) * 0.5
+        log(f'Grid bbox: [{bbox_min}] -> [{bbox_max}], cell_size={cell_size*1000:.2f}mm')
+
+        yield (f'Testing voxel occupancy ({grid_size}³)...', 5)
+        t_occ = time.time()
+
+        # Use a dict/set for sparse storage - most cells in a 3D model are empty
+        occupied = set()
+        # To find candidates: iterate over BVH faces, rasterize their AABB into voxels
+        for fi, tri_verts_idx in enumerate(polys_list):
+            v0 = verts_world[tri_verts_idx[0]]
+            v1 = verts_world[tri_verts_idx[1]]
+            v2 = verts_world[tri_verts_idx[2]]
+            tri_min = np.minimum(np.minimum(v0, v1), v2)
+            tri_max = np.maximum(np.maximum(v0, v1), v2)
+            ix0 = max(0, int((tri_min[0] - bbox_min[0]) / cell_size))
+            iy0 = max(0, int((tri_min[1] - bbox_min[1]) / cell_size))
+            iz0 = max(0, int((tri_min[2] - bbox_min[2]) / cell_size))
+            ix1 = min(grid_size - 1, int((tri_max[0] - bbox_min[0]) / cell_size) + 1)
+            iy1 = min(grid_size - 1, int((tri_max[1] - bbox_min[1]) / cell_size) + 1)
+            iz1 = min(grid_size - 1, int((tri_max[2] - bbox_min[2]) / cell_size) + 1)
+            for ix in range(ix0, ix1 + 1):
+                for iy in range(iy0, iy1 + 1):
+                    for iz in range(iz0, iz1 + 1):
+                        key = (ix, iy, iz)
+                        if key in occupied:
+                            continue
+                        cx = bbox_min[0] + (ix + 0.5) * cell_size
+                        cy = bbox_min[1] + (iy + 0.5) * cell_size
+                        cz = bbox_min[2] + (iz + 0.5) * cell_size
+                        cell_center = mathutils.Vector((cx, cy, cz))
+                        nearest = bvh.find_nearest(cell_center)
+                        if nearest is not None and nearest[3] < half_diag:
+                            occupied.add(key)
+            # Yield every 5000 faces
+            if fi % 5000 == 0:
+                pct = 5 + int(10 * fi / len(polys_list))
+                yield (f'Rasterizing faces {fi}/{len(polys_list)}...', pct)
+
+        log(f'Occupancy: {len(occupied)} occupied voxels / {grid_size**3} total, in {time.time() - t_occ:.1f}s')
+        yield (f'{len(occupied)} occupied voxels found', 15)
+
+        # Phase 4: Surface face extraction - keep face only if neighbor is empty
+        yield ('Extracting surface faces...', 17)
+        t_faces = time.time()
+        # For each face, we store: (ix, iy, iz, dir_idx)
+        faces_to_emit = []
+        for (ix, iy, iz) in occupied:
+            for di, (dx, dy, dz) in enumerate(DIRS):
+                neighbor = (ix + dx, iy + dy, iz + dz)
+                if neighbor not in occupied:
+                    faces_to_emit.append((ix, iy, iz, di))
+        log(f'Surface faces: {len(faces_to_emit)} (culled from {len(occupied) * 6} potential) in {time.time() - t_faces:.1f}s')
+        yield (f'{len(faces_to_emit)} surface faces', 20)
+
+        # Phase 5: Color sampling per face via BVHTree -> UV -> texture
+        yield ('Sampling texture color per face...', 22)
+        t_color = time.time()
+        uv_layer = mesh.uv_layers[uv_name].data
+        face_colors = np.zeros((len(faces_to_emit), 3), dtype=np.float32)
+
+        for fi, (ix, iy, iz, di) in enumerate(faces_to_emit):
+            # Voxel center
+            vx = bbox_min[0] + (ix + 0.5) * cell_size
+            vy = bbox_min[1] + (iy + 0.5) * cell_size
+            vz = bbox_min[2] + (iz + 0.5) * cell_size
+            # Face center (offset by half cell in the face-normal direction)
+            dx, dy, dz = DIRS[di]
+            fc = mathutils.Vector((vx + dx * cell_size * 0.5, vy + dy * cell_size * 0.5, vz + dz * cell_size * 0.5))
+
+            nearest = bvh.find_nearest(fc)
+            if nearest is None:
+                continue
+            hit_loc, hit_norm, bvh_face_idx, dist = nearest
+
+            # Get original polygon index
+            poly_idx = bvh_face_to_poly[bvh_face_idx]
+            poly = mesh.polygons[poly_idx]
+            li = poly.loop_indices
+            ln = poly.loop_total
+
+            if ln < 3:
+                continue
+
+            # Barycentric interpolation of UV at hit_location
+            uv0 = uv_layer[li[0]].uv
+            uv1 = uv_layer[li[1]].uv
+            uv2 = uv_layer[li[2]].uv
+
+            # Transform hit to local space for barycentric computation
+            M_inv = np.array(obj.matrix_world.inverted(), dtype=np.float32)
+            hit_local_pt = M_inv[:3, :3] @ np.array(hit_loc, dtype=np.float32) + M_inv[:3, 3]
+
+            v0_local = verts_local[poly.vertices[0]]
+            v1_local = verts_local[poly.vertices[1]]
+            v2_local = verts_local[poly.vertices[2]]
+
+            # Barycentric weights in 3D space
+            e0 = v1_local - v0_local
+            e1 = v2_local - v0_local
+            ep = hit_local_pt - v0_local
+            d00 = float(np.dot(e0, e0)); d01 = float(np.dot(e0, e1))
+            d11 = float(np.dot(e1, e1)); dp0 = float(np.dot(ep, e0))
+            dp1 = float(np.dot(ep, e1))
+            denom = d00 * d11 - d01 * d01
+            if abs(denom) < 1e-12:
+                u = 0.0; v = 0.0; w = 1.0  # degenerate -> use v0
+            else:
+                v = (d11 * dp0 - d01 * dp1) / denom
+                w = (d00 * dp1 - d01 * dp0) / denom
+                u = 1.0 - v - w
+
+            # Clamp barycentric coords to [0,1] (hit_loc may be slightly outside triangle)
+            u = max(0.0, min(1.0, u))
+            v = max(0.0, min(1.0, v))
+            w = max(0.0, min(1.0, w))
+            total = u + v + w
+            if total > 1e-8:
+                u /= total; v /= total; w /= total
+
+            # Interpolate UV
+            u_hit = u * uv0[0] + v * uv1[0] + w * uv2[0]
+            v_hit = u * uv0[1] + v * uv1[1] + w * uv2[1]
+            u_hit = u_hit - math.floor(u_hit)
+            v_hit = v_hit - math.floor(v_hit)
+
+            # Sample texture (nearest-neighbor)
+            tx = min(w_img - 1, int(u_hit * w_img))
+            ty = min(h_img - 1, int(v_hit * h_img))
+            face_colors[fi, 0] = img[ty, tx, 0]
+            face_colors[fi, 1] = img[ty, tx, 1]
+            face_colors[fi, 2] = img[ty, tx, 2]
+
+            if fi % 10000 == 0 and fi > 0:
+                pct = 22 + int(18 * fi / len(faces_to_emit))
+                yield (f'Sampling colors {fi}/{len(faces_to_emit)}...', pct)
+
+        log(f'Color sampling done in {time.time() - t_color:.1f}s')
+        yield (f'Colors sampled ({len(faces_to_emit)} faces)', 40)
+
 class SNA_OT_test_progressive_separate(bpy.types.Operator):
     bl_idname = 'sna.test_progressive_separate'
     bl_label = 'Self-Test: Progressive Separate'
