@@ -3913,29 +3913,55 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         log(f'BVH verified: +{verified} -{rejected}, total occupied={len(occupied)} in {time.time() - t_occ:.1f}s')
         yield (f'{len(occupied)} occupied cells (+{verified} BVH verified)', 17)
 
-        # Phase 3b: Interior fill via scanline parity along Y axis.
-        # Contiguous occupied blocks = single surface crossing (like Blender Remesh).
-        yield ('Filling interior via scanline...', 18)
+        # Phase 3b: Interior fill via EXTERIOR flood fill (handles open relief geometry).
+        # Scanline parity smeared floating features down to the backplate: any column
+        # hitting feature-gap-plate filled the gap solid. Flood-fill from the grid
+        # boundary (which the bbox margin guarantees is air) instead: every empty cell
+        # reachable from outside stays empty — gaps behind a floating pickaxe, armpit
+        # holes, the space under dangling pig legs. Only truly enclosed cavities (inside
+        # the plate, inside thick solid features) get filled. Works in all 3 axes, unlike
+        # the Y-only parity scan.
+        yield ('Filling interior via flood fill...', 18)
         t_fill = time.time()
-        n_filled = 0
-        for ix in range(grid_size_x):
-            for iz in range(grid_size_z):
-                inside = False
-                iy = 0
-                while iy < grid_size_y:
-                    if (ix, iy, iz) in occupied:
-                        # Skip contiguous occupied block — single crossing
-                        while iy < grid_size_y and (ix, iy, iz) in occupied:
-                            iy += 1
-                        inside = not inside
-                    else:
-                        if inside:
-                            occupied.add((ix, iy, iz))
-                            n_filled += 1
-                        iy += 1
-            if ix % 50 == 0:
-                yield (f'Filling column {ix}/{grid_size_x} (+{n_filled} cells)...', 18)
-        log(f'Interior fill: +{n_filled} cells, total {len(occupied)} occupied, in {time.time() - t_fill:.1f}s')
+        gx, gy, gz = grid_size_x, grid_size_y, grid_size_z
+        occ = np.zeros((gx, gy, gz), dtype=bool)
+        if occupied:
+            idx = np.fromiter((v for cell in occupied for v in cell), dtype=np.int64,
+                              count=len(occupied) * 3).reshape(-1, 3)
+            occ[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+        free = ~occ
+        # Seed exterior from all 6 grid faces (border is air thanks to bbox margin)
+        exterior = np.zeros_like(occ)
+        exterior[0, :, :] |= free[0, :, :];   exterior[-1, :, :] |= free[-1, :, :]
+        exterior[:, 0, :] |= free[:, 0, :];   exterior[:, -1, :] |= free[:, -1, :]
+        exterior[:, :, 0] |= free[:, :, 0];   exterior[:, :, -1] |= free[:, :, -1]
+        # Vectorized BFS: dilate exterior through free space until stable
+        prev_count = -1
+        it = 0
+        max_it = gx + gy + gz + 4  # bound: longest shortest-path through the grid
+        while it < max_it:
+            cnt = int(exterior.sum())
+            if cnt == prev_count:
+                break
+            prev_count = cnt
+            nxt = exterior.copy()
+            nxt[1:, :, :]  |= exterior[:-1, :, :]
+            nxt[:-1, :, :] |= exterior[1:, :, :]
+            nxt[:, 1:, :]  |= exterior[:, :-1, :]
+            nxt[:, :-1, :] |= exterior[:, 1:, :]
+            nxt[:, :, 1:]  |= exterior[:, :, :-1]
+            nxt[:, :, :-1] |= exterior[:, :, 1:]
+            nxt &= free
+            exterior = nxt
+            it += 1
+            if it % 20 == 0:
+                yield (f'Flood fill pass {it} ({cnt} exterior cells)...', 18)
+        interior = free & ~exterior
+        fill_idx = np.argwhere(interior)
+        n_filled = len(fill_idx)
+        for x, y, z in fill_idx:
+            occupied.add((int(x), int(y), int(z)))
+        log(f'Interior fill (flood): +{n_filled} cells in {it} passes, total {len(occupied)} occupied, in {time.time() - t_fill:.1f}s')
         yield (f'{len(occupied)} total cells (+{n_filled} interior filled)', 20)
 
         # Phase 4: Surface face extraction - keep face only if neighbor is empty
