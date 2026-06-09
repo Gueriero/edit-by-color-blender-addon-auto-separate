@@ -4127,31 +4127,26 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                 if mask.any():
                     cluster_rgb[c] = face_colors[mask].mean(axis=0)
 
-        slot_map = {}
+        # Always mint a FRESH material datablock per cluster, per run. Blender
+        # auto-suffixes the name (EBC_Voxel_000.001, ...) if taken. This keeps every
+        # voxelization's materials independent — never shared with prior meshes, so
+        # editing one mesh's colors can't leak into another. Attach only to result_obj
+        # below (not the source obj).
+        cluster_mats = {}
         for c in range(K):
             if not (face_labels == c).any():
                 continue
             r, g, b = float(cluster_rgb[c, 0]), float(cluster_rgb[c, 1]), float(cluster_rgb[c, 2])
-            mat_name = f'EBC_Voxel_{c:03d}'
-            mat = bpy.data.materials.get(mat_name)
-            if mat is None:
-                mat = bpy.data.materials.new(mat_name)
-                mat.use_nodes = True
-            if mat.use_nodes and mat.node_tree:
+            mat = bpy.data.materials.new(f'EBC_Voxel_{c:03d}')
+            mat.use_nodes = True
+            if mat.node_tree:
                 for nd in mat.node_tree.nodes:
                     if nd.type == 'BSDF_PRINCIPLED':
                         nd.inputs['Base Color'].default_value = (r, g, b, 1.0); break
             mat.diffuse_color = (r, g, b, 1.0)
-            slot_idx = -1
-            for si, s in enumerate(obj.material_slots):
-                if s.material and s.material.name == mat.name:
-                    slot_idx = si; break
-            if slot_idx < 0:
-                obj.data.materials.append(mat)
-                slot_idx = len(obj.material_slots) - 1
-            slot_map[c] = slot_idx
-        log(f'Materials: {len(slot_map)} non-empty clusters')
-        yield (f'{len(slot_map)} materials created', 60)
+            cluster_mats[c] = mat
+        log(f'Materials: {len(cluster_mats)} non-empty clusters (fresh datablocks)')
+        yield (f'{len(cluster_mats)} materials created', 60)
 
         # Phase 9: Build output geometry via bmesh
         yield ('Building block geometry...', 62)
@@ -4167,20 +4162,9 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         bm = bmesh.new()
         # Copy materials to result object slots
         result_slot_map = {}
-        for c in slot_map:
-            mat_name = f'EBC_Voxel_{c:03d}'
-            mat = bpy.data.materials.get(mat_name)
-            if mat is None:
-                continue
-            # Check if already in result object slots
-            found = -1
-            for si, s in enumerate(result_obj.material_slots):
-                if s.material and s.material.name == mat.name:
-                    found = si; break
-            if found < 0:
-                result_obj.data.materials.append(mat)
-                found = len(result_obj.material_slots) - 1
-            result_slot_map[c] = found
+        for c, mat in cluster_mats.items():
+            result_obj.data.materials.append(mat)
+            result_slot_map[c] = len(result_obj.material_slots) - 1
 
         def get_face_corners(ix, iy, iz, di):
             """Return 4 world-space corner positions of the face (quad, counter-clockwise from outside)."""
@@ -4249,7 +4233,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
 
         elapsed = time.time() - t_start
         log(f'=== Voxel Block Remesh finished in {elapsed:.1f}s ===')
-        yield (f'Done in {elapsed:.0f}s — {len(slot_map)} colors', 100)
+        yield (f'Done in {elapsed:.0f}s — {len(cluster_mats)} colors', 100)
 
 class SNA_OT_test_progressive_separate(bpy.types.Operator):
     bl_idname = 'sna.test_progressive_separate'
