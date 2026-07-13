@@ -1245,6 +1245,8 @@ class SNA_PT_EDIT_BY_COLOUR_BY_KIRI_ENGINE_955BF(bpy.types.Panel):
         sna_auto_palette_interface(layout)
         layout.separator(factor=1.0)
         sna_voxel_block_remesh_interface(layout)
+        layout.separator(factor=1.0)
+        sna_bake_materials_interface(layout)
 
 
 class SNA_OT_Open_Edit_By_Colour_Documentation_1Eac5(bpy.types.Operator):
@@ -2719,6 +2721,23 @@ def _sna_rgb_to_hsv_np(arr):
     return np.stack([h_, s, mx], axis=1)
 
 
+def _sna_kmeanspp_pick(rng, dist_sq):
+    """k-means++ weighted pick via inverse-CDF.
+
+    rng.choice(p=...) rejects float32 weights: it demands sum(p) == 1 within ~1.5e-8, and summing
+    thousands of float32 values drifts past that. Degenerate input (every sample already on a
+    center, so all distances are 0) has no valid distribution at all — fall back to uniform."""
+    import numpy as np
+    w = np.asarray(dist_sq, dtype=np.float64)
+    w[~np.isfinite(w)] = 0.0
+    np.maximum(w, 0.0, out=w)
+    total = w.sum()
+    if not np.isfinite(total) or total <= 0.0:
+        return int(rng.integers(0, w.shape[0]))
+    cdf = np.cumsum(w)
+    return int(np.searchsorted(cdf, rng.random() * total, side='right').clip(0, w.shape[0] - 1))
+
+
 class SNA_OT_palette_split_and_colorize(bpy.types.Operator):
     bl_idname = 'sna.palette_split_and_colorize'
     bl_label = 'Split & Colorize by Palette'
@@ -2802,11 +2821,10 @@ class SNA_OT_palette_split_and_colorize(bpy.types.Operator):
             br = base.color[0] * v_mul
             bg = base.color[1] * v_mul
             bb = base.color[2] * v_mul
-            mat_name = f'EBC_Pal_{base_idx}_{bin_idx}'
-            mat = bpy.data.materials.get(mat_name)
-            if mat is None:
-                mat = bpy.data.materials.new(mat_name)
-                mat.use_nodes = True
+            # fresh datablock per run — reusing by name would repaint the
+            # materials of objects split in earlier runs
+            mat = bpy.data.materials.new(f'EBC_Pal_{base_idx}_{bin_idx}')
+            mat.use_nodes = True
             if mat.use_nodes and mat.node_tree:
                 for nd in mat.node_tree.nodes:
                     if nd.type == 'BSDF_PRINCIPLED':
@@ -3165,6 +3183,12 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             sample = cluster_data
 
         K = self.num_clusters
+        # a baked flat-colour texture holds only a handful of distinct colours; asking for more
+        # clusters than that leaves k-means++ with nothing to seed from
+        n_uniq = int(np.unique(sample, axis=0).shape[0])
+        if K > n_uniq:
+            log(f'Only {n_uniq} distinct colors in the source — clamping K from {K} to {n_uniq}')
+            K = max(1, n_uniq)
         log(f'K-means++ init for K={K} on {sample.shape[0]} samples...')
         yield (f'K-means init K={K}...', 44)
         t_km = time.time()
@@ -3176,8 +3200,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             diff = sample - centers[-1]
             d2 = np.sum(diff * diff, axis=1)
             dist_sq = np.minimum(dist_sq, d2)
-            probs = dist_sq / max(dist_sq.sum(), 1e-12)
-            nxt = rng.choice(sample.shape[0], p=probs)
+            nxt = _sna_kmeanspp_pick(rng, dist_sq)
             centers.append(sample[nxt])
         centers = np.stack(centers, axis=0)
 
@@ -3236,13 +3259,10 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             if not (face_labels == c).any():
                 continue
             r, g, b = float(cluster_rgb[c, 0]), float(cluster_rgb[c, 1]), float(cluster_rgb[c, 2])
-            mat_name = f'EBC_Auto_{c:03d}'
-            mat = bpy.data.materials.get(mat_name)
-            if mat is None:
-                mat = bpy.data.materials.new(mat_name)
-                mat.use_nodes = True
-            # always (re)write Base Color + diffuse — reused materials may carry
-            # stale colour from a previous run
+            # fresh datablock per run — reusing by name would repaint the
+            # materials of objects split in earlier runs
+            mat = bpy.data.materials.new(f'EBC_Auto_{c:03d}')
+            mat.use_nodes = True
             if mat.use_nodes and mat.node_tree:
                 for nd in mat.node_tree.nodes:
                     if nd.type == 'BSDF_PRINCIPLED':
@@ -3630,6 +3650,24 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         name='Total Colors', default=16, min=2, max=256,
         description='Number of palette colors (K for k-means). Each color becomes one material',
     )
+    cap_side: bpy.props.EnumProperty(
+        name='Cap Open Side', default='NONE',
+        items=[('NONE', 'None (mesh is closed)', 'Flood the exterior from all 6 grid faces. Correct for a watertight mesh', 0, 0),
+               ('Z_NEG', 'Bottom (-Z)', 'Treat the bottom of the grid as sealed', 0, 1),
+               ('Z_POS', 'Top (+Z)', 'Treat the top of the grid as sealed', 0, 2),
+               ('Y_NEG', 'Back (-Y)', 'Treat the back of the grid as sealed. Typical for a relief with an open back', 0, 3),
+               ('Y_POS', 'Front (+Y)', 'Treat the front of the grid as sealed', 0, 4),
+               ('X_NEG', 'Left (-X)', 'Treat the -X side of the grid as sealed', 0, 5),
+               ('X_POS', 'Right (+X)', 'Treat the +X side of the grid as sealed', 0, 6)],
+        description=('Which grid face NOT to seed the exterior flood fill from. An open mesh (relief with no back, '
+                     'model cut off at the bottom) lets air walk inside through the opening, so nothing counts as '
+                     'interior and the result is a one-cell shell. Sealing the open side makes the volume fill up'),
+    )
+    wall_cells: bpy.props.IntProperty(
+        name='Wall Thickness (cells)', default=0, min=0, max=20,
+        description=('0 = fill the whole interior (solid). N > 0 = fill only N cells inward from the surface, '
+                     'leaving the core hollow. Needs an interior to exist, so pair it with Cap Open Side on an open mesh'),
+    )
     kmeans_iters: bpy.props.IntProperty(
         name='K-means Iterations', default=20, min=2, max=100,
     )
@@ -3930,11 +3968,17 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                               count=len(occupied) * 3).reshape(-1, 3)
             occ[idx[:, 0], idx[:, 1], idx[:, 2]] = True
         free = ~occ
-        # Seed exterior from all 6 grid faces (border is air thanks to bbox margin)
+        # Seed exterior from the grid faces (border is air thanks to bbox margin). A capped side is
+        # left unseeded: on an open mesh (relief with no back) air otherwise walks in through the
+        # opening, nothing is enclosed, and the result is a one-cell shell.
+        cap = self.cap_side
         exterior = np.zeros_like(occ)
-        exterior[0, :, :] |= free[0, :, :];   exterior[-1, :, :] |= free[-1, :, :]
-        exterior[:, 0, :] |= free[:, 0, :];   exterior[:, -1, :] |= free[:, -1, :]
-        exterior[:, :, 0] |= free[:, :, 0];   exterior[:, :, -1] |= free[:, :, -1]
+        if cap != 'X_NEG': exterior[0, :, :]  |= free[0, :, :]
+        if cap != 'X_POS': exterior[-1, :, :] |= free[-1, :, :]
+        if cap != 'Y_NEG': exterior[:, 0, :]  |= free[:, 0, :]
+        if cap != 'Y_POS': exterior[:, -1, :] |= free[:, -1, :]
+        if cap != 'Z_NEG': exterior[:, :, 0]  |= free[:, :, 0]
+        if cap != 'Z_POS': exterior[:, :, -1] |= free[:, :, -1]
         # Vectorized BFS: dilate exterior through free space until stable
         prev_count = -1
         it = 0
@@ -3957,24 +4001,51 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             if it % 20 == 0:
                 yield (f'Flood fill pass {it} ({cnt} exterior cells)...', 18)
         interior = free & ~exterior
-        fill_idx = np.argwhere(interior)
-        n_filled = len(fill_idx)
-        for x, y, z in fill_idx:
-            occupied.add((int(x), int(y), int(z)))
-        log(f'Interior fill (flood): +{n_filled} cells in {it} passes, total {len(occupied)} occupied, in {time.time() - t_fill:.1f}s')
-        yield (f'{len(occupied)} total cells (+{n_filled} interior filled)', 20)
+        if self.wall_cells > 0:
+            # keep the core hollow: occupy only the interior cells within N steps of the surface
+            grow = occ.copy()
+            for _ in range(self.wall_cells):
+                nxt = grow.copy()
+                nxt[1:, :, :]  |= grow[:-1, :, :]
+                nxt[:-1, :, :] |= grow[1:, :, :]
+                nxt[:, 1:, :]  |= grow[:, :-1, :]
+                nxt[:, :-1, :] |= grow[:, 1:, :]
+                nxt[:, :, 1:]  |= grow[:, :, :-1]
+                nxt[:, :, :-1] |= grow[:, :, 1:]
+                grow = nxt
+            to_fill = interior & grow
+        else:
+            to_fill = interior
+        # from here on occupancy lives in the numpy grid, not the python set: a solid fill can add
+        # millions of cells, and a set of that many tuples costs hundreds of MB and minutes to walk
+        occ |= to_fill
+        n_filled = int(to_fill.sum())
+        n_occupied = int(occ.sum())
+        mode = 'solid' if self.wall_cells == 0 else f'{self.wall_cells}-cell wall'
+        log(f'Interior fill (flood, cap={cap}, {mode}): +{n_filled} cells in {it} passes, '
+            f'total {n_occupied} occupied, in {time.time() - t_fill:.1f}s')
+        if n_filled < n_occupied // 100 and cap == 'NONE':
+            log('HINT: almost nothing was enclosed — the mesh is probably open. Set Cap Open Side '
+                '(e.g. Back (-Y) for a relief) to fill the volume instead of getting a hollow shell.')
+        yield (f'{n_occupied} total cells (+{n_filled} interior filled)', 20)
 
         # Phase 4: Surface face extraction - keep face only if neighbor is empty
         yield ('Extracting surface faces...', 22)
         t_faces = time.time()
         # For each face, we store: (ix, iy, iz, dir_idx)
         faces_to_emit = []
-        for (ix, iy, iz) in occupied:
-            for di, (dx, dy, dz) in enumerate(DIRS):
-                neighbor = (ix + dx, iy + dy, iz + dz)
-                if neighbor not in occupied:
-                    faces_to_emit.append((ix, iy, iz, di))
-        log(f'Surface faces: {len(faces_to_emit)} (culled from {len(occupied) * 6} potential) in {time.time() - t_faces:.1f}s')
+        for di, (dx, dy, dz) in enumerate(DIRS):
+            # occupancy of the neighbour in direction di; cells outside the grid count as empty
+            nbr = np.zeros_like(occ)
+            src = occ[max(dx, 0):gx + min(dx, 0),
+                      max(dy, 0):gy + min(dy, 0),
+                      max(dz, 0):gz + min(dz, 0)]
+            nbr[max(-dx, 0):gx + min(-dx, 0),
+                max(-dy, 0):gy + min(-dy, 0),
+                max(-dz, 0):gz + min(-dz, 0)] = src
+            cells = np.argwhere(occ & ~nbr)
+            faces_to_emit.extend((int(x), int(y), int(z), di) for x, y, z in cells)
+        log(f'Surface faces: {len(faces_to_emit)} (culled from {n_occupied * 6} potential) in {time.time() - t_faces:.1f}s')
         yield (f'{len(faces_to_emit)} surface faces', 25)
 
         # Phase 5: Color sampling per face via BVHTree -> UV -> texture
@@ -4086,6 +4157,13 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         else:
             sample = cluster_data
 
+        # a baked flat-colour texture holds only a handful of distinct colours; asking for more
+        # clusters than that leaves k-means++ with nothing to seed from
+        n_uniq = int(np.unique(sample, axis=0).shape[0])
+        if K > n_uniq:
+            log(f'Only {n_uniq} distinct colors in the source — clamping K from {K} to {n_uniq}')
+            K = max(1, n_uniq)
+
         rng = np.random.default_rng(42)
         first = rng.integers(0, sample.shape[0])
         centers = [sample[first]]
@@ -4094,8 +4172,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             diff = sample - centers[-1]
             d2 = np.sum(diff * diff, axis=1)
             dist_sq = np.minimum(dist_sq, d2)
-            probs = dist_sq / max(dist_sq.sum(), 1e-12)
-            nxt = rng.choice(sample.shape[0], p=probs)
+            nxt = _sna_kmeanspp_pick(rng, dist_sq)
             centers.append(sample[nxt])
         centers = np.stack(centers, axis=0)
 
@@ -4215,17 +4292,19 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             else:  # -Z
                 return [(x0,y1,z0), (x1,y1,z0), (x1,y0,z0), (x0,y0,z0)]
 
+        # NOTE: never call bm.verts.ensure_lookup_table() in this loop — every new vert
+        # invalidates the table, so rebuilding it per face makes the whole phase O(N^2)
+        # (tens of minutes at ~300k faces). Nothing here indexes bm.verts, so it is not needed.
         for fi, (ix, iy, iz, di) in enumerate(faces_to_emit):
             cluster = face_labels[fi]
             if cluster not in result_slot_map:
                 continue  # empty cluster, skip
             corners = get_face_corners(ix, iy, iz, di)
             verts = [bm.verts.new(c) for c in corners]
-            bm.verts.ensure_lookup_table()
             face = bm.faces.new(verts)  # corners already CCW from outside
             face.material_index = result_slot_map[cluster]
 
-            if fi % 10000 == 0 and fi > 0:
+            if fi % 20000 == 0 and fi > 0:
                 pct = 62 + int(26 * fi / len(faces_to_emit))
                 yield (f'Building geometry {fi}/{len(faces_to_emit)}...', pct)
 
@@ -4260,6 +4339,451 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         elapsed = time.time() - t_start
         log(f'=== Voxel Block Remesh finished in {elapsed:.1f}s ===')
         yield (f'Done in {elapsed:.0f}s — {len(cluster_mats)} colors', 100)
+
+class SNA_OT_bake_materials_to_texture(bpy.types.Operator):
+    bl_idname = 'sna.bake_materials_to_texture'
+    bl_label = 'Bake Materials to Texture'
+    bl_description = ('Bakes the flat per-material colours of the active mesh into a single image texture: '
+                      'material-aware unwrap + rasterization of face colours. Result is one object with one '
+                      'material + image texture, ready for Palette Split / Voxel Block Remesh')
+    bl_options = {'REGISTER', 'UNDO'}
+
+    resolution: bpy.props.EnumProperty(
+        name='Texture Size', default='2048',
+        items=[('512', '512', '', 0, 0), ('1024', '1024', '', 0, 1), ('2048', '2048', '', 0, 2),
+               ('4096', '4096', '', 0, 3), ('8192', '8192', '', 0, 4)],
+        description='Resolution of the baked texture. Flat colours need little resolution; higher only sharpens island borders',
+    )
+    uv_method: bpy.props.EnumProperty(
+        name='Unwrap', default='MATERIAL',
+        items=[('MATERIAL', 'Material-Aware', 'Seam every edge between two different materials (plus sharp edges), then Angle-Based unwrap. Islands of different colours never touch in UV — no colour bleed on face borders', 0, 0),
+               ('SMART', 'Smart UV Project', 'Plain Smart UV Project. Faces of different materials can end up adjacent in UV, which bleeds colour across their shared edge', 0, 1)],
+        description='How to build the UV layout before rasterizing',
+    )
+    angle_limit_deg: bpy.props.FloatProperty(
+        name='UV Angle Limit', default=66.0, min=1.0, max=89.0,
+        description='Edges sharper than this become UV seams (also the Smart UV Project angle limit)',
+    )
+    island_margin: bpy.props.FloatProperty(
+        name='UV Island Margin', default=0.005, min=0.0, max=0.2, precision=3,
+        description='Gap between UV islands. Bigger = safer against colour bleed between islands',
+    )
+    conservative_px: bpy.props.FloatProperty(
+        name='Face Halo (px)', default=0.75, min=0.0, max=3.0, precision=2,
+        description=('Rasterize each face this much wider than its exact UV triangle. Kills the dark speckles along '
+                     'face borders (a face sampling the neighbour colour from a half-covered texel). 0 = exact'),
+    )
+    dilate_px: bpy.props.IntProperty(
+        name='Edge Padding (px)', default=8, min=0, max=64,
+        description='Grow baked colours outward into empty pixels, so texture filtering never samples background',
+    )
+    pad_blur: bpy.props.IntProperty(
+        name='Padding Blur', default=2, min=0, max=8,
+        description=('Blur passes over the padding only. Softens the hard colour steps outside the islands so mipmaps '
+                     'and compression do not drag them back in. Island interiors stay untouched, so the colours the '
+                     'pipeline reads back remain exact'),
+    )
+    work_on_copy: bpy.props.BoolProperty(
+        name='Work on Copy', default=True,
+        description='Bake into a duplicate object named <name>_baked, leaving the original untouched',
+    )
+    exact_roundtrip: bpy.props.BoolProperty(
+        name='Exact Colour Round-Trip', default=True,
+        description=('Store linear values in a Non-Color texture, so the colours the Palette/Voxel pipeline reads back '
+                     'are identical to the original material colours. Turn off for a standard sRGB texture '
+                     '(better for exporting to other tools, but the pipeline reads back gamma-shifted colours)'),
+    )
+    setup_ebc_modifier: bpy.props.BoolProperty(
+        name='Add EBC Modifier + Wire Texture', default=True,
+        description='Add the KIRI Edit By Colour modifier on the result and point its UV Map / Base Texture at the bake',
+    )
+
+    _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+    _UV_NAME = 'EBC_Bake_UV'
+
+    @staticmethod
+    def _material_color(mat):
+        """Flat RGB of a material, or None if its Base Color is driven by a texture/procedural."""
+        if mat is None:
+            return None
+        if not mat.use_nodes or mat.node_tree is None:
+            return tuple(mat.diffuse_color[:3])
+        nt = mat.node_tree
+        out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+        if out is None:
+            out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+        node = None
+        if out is not None and out.inputs['Surface'].is_linked:
+            node = out.inputs['Surface'].links[0].from_node
+        if node is None or node.type == 'REROUTE':
+            node = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if node is None:
+            return None
+        inp = None
+        for key in ('Base Color', 'Color'):
+            if key in node.inputs:
+                inp = node.inputs[key]
+                break
+        if inp is None:
+            return None
+        hops = 0
+        while inp.is_linked and hops < 8:
+            fn = inp.links[0].from_node
+            hops += 1
+            if fn.type == 'REROUTE':
+                inp = fn.inputs[0]
+                continue
+            if fn.type == 'RGB':
+                return tuple(fn.outputs[0].default_value[:3])
+            return None
+        return tuple(inp.default_value[:3])
+
+    @staticmethod
+    def _mark_material_seams(me, angle_rad):
+        """Seam = edge between two different materials, sharp edge, or mesh boundary.
+        Keeps islands of different colours apart in UV, so no colour bleeds across a face border."""
+        import numpy as np
+        n_edges = len(me.edges)
+        n_polys = len(me.polygons)
+        n_loops = len(me.loops)
+        if n_edges == 0 or n_polys == 0:
+            return 0
+
+        loop_edge = np.empty(n_loops, dtype=np.int32)
+        me.loops.foreach_get('edge_index', loop_edge)
+        poly_total = np.empty(n_polys, dtype=np.int32)
+        me.polygons.foreach_get('loop_total', poly_total)
+        loop_poly = np.repeat(np.arange(n_polys, dtype=np.int32), poly_total)
+        poly_mat = np.empty(n_polys, dtype=np.int32)
+        me.polygons.foreach_get('material_index', poly_mat)
+        fnorm = np.empty(n_polys * 3, dtype=np.float32)
+        me.polygons.foreach_get('normal', fnorm)
+        fnorm = fnorm.reshape(n_polys, 3)
+
+        face_count = np.bincount(loop_edge, minlength=n_edges)
+        seam = np.ones(n_edges, dtype=bool)          # boundary / non-manifold always seams
+        two = face_count == 2
+        if two.any():
+            order = np.argsort(loop_edge, kind='stable')
+            e_sorted = loop_edge[order]
+            f_sorted = loop_poly[order]
+            starts = np.searchsorted(e_sorted, np.arange(n_edges, dtype=np.int32), side='left')
+            s = starts[two]
+            f1 = f_sorted[s]
+            f2 = f_sorted[s + 1]
+            dot = np.clip((fnorm[f1] * fnorm[f2]).sum(axis=1), -1.0, 1.0)
+            sharp = np.arccos(dot) > angle_rad
+            seam[two] = (poly_mat[f1] != poly_mat[f2]) | sharp
+        me.edges.foreach_set('use_seam', seam)
+        me.update()
+        return int(seam.sum())
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=350)
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, 'No active mesh'); return {'CANCELLED'}
+        if len(obj.data.polygons) == 0:
+            self.report({'ERROR'}, 'Mesh has no polygons'); return {'CANCELLED'}
+        if len(obj.material_slots) == 0:
+            self.report({'ERROR'}, 'Mesh has no materials to bake'); return {'CANCELLED'}
+        if obj.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        self._gen = self._work(context, obj)
+        self._spin_idx = 0
+        try:
+            first = next(self._gen)
+            self._apply_status(context, first)
+        except StopIteration:
+            self._cleanup(context)
+            return {'FINISHED'}
+        except Exception as e:
+            self._cleanup(context)
+            self.report({'ERROR'}, f'{type(e).__name__}: {e}')
+            return {'CANCELLED'}
+        wm = context.window_manager
+        wm.progress_begin(0, 100)
+        self._timer = wm.event_timer_add(0.08, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            print('[BakeMat] cancelled by ESC', flush=True)
+            self._cleanup(context)
+            self.report({'WARNING'}, 'Bake cancelled')
+            return {'CANCELLED'}
+        if event.type == 'TIMER':
+            try:
+                self._apply_status(context, next(self._gen))
+            except StopIteration:
+                self._cleanup(context)
+                return {'FINISHED'}
+            except Exception as e:
+                print(f'[BakeMat] FAILED: {type(e).__name__}: {e}', flush=True)
+                self._cleanup(context)
+                self.report({'ERROR'}, f'{type(e).__name__}: {e}')
+                return {'CANCELLED'}
+        return {'PASS_THROUGH'}
+
+    def _apply_status(self, context, status):
+        text, pct = (status if isinstance(status, tuple) else (status, None))
+        self._spin_idx = (self._spin_idx + 1) % len(self._SPIN)
+        full = f'{self._SPIN[self._spin_idx]}  EBC Bake: {text}   (ESC to cancel)'
+        try:
+            if context.workspace:
+                context.workspace.status_text_set(full)
+        except Exception:
+            pass
+        if pct is not None:
+            try: context.window_manager.progress_update(max(0, min(100, int(pct))))
+            except Exception: pass
+
+    def _cleanup(self, context):
+        wm = context.window_manager
+        if getattr(self, '_timer', None) is not None:
+            try: wm.event_timer_remove(self._timer)
+            except Exception: pass
+            self._timer = None
+        try: wm.progress_end()
+        except Exception: pass
+        try:
+            if context.workspace:
+                context.workspace.status_text_set(None)
+        except Exception:
+            pass
+
+    def _work(self, context, src_obj):
+        import numpy as np, math, time
+        t_start = time.time()
+        def log(m): print(f'[BakeMat] {m}', flush=True)
+
+        res = int(self.resolution)
+        log(f'=== Bake Materials to Texture: {src_obj.name}, {res}x{res} ===')
+
+        if self.work_on_copy:
+            yield ('Duplicating object...', 2)
+            obj = src_obj.copy()
+            obj.data = src_obj.data.copy()
+            obj.name = f'{src_obj.name}_baked'
+            for coll in src_obj.users_collection:
+                coll.objects.link(obj)
+        else:
+            obj = src_obj
+        for o in context.view_layer.objects:
+            o.select_set(False)
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        me = obj.data
+
+        yield ('Reading material colours...', 5)
+        n_slots = max(1, len(obj.material_slots))
+        mat_cols = np.full((n_slots, 3), 0.8, dtype=np.float32)
+        textured = []
+        for i, slot in enumerate(obj.material_slots):
+            col = self._material_color(slot.material)
+            if col is None:
+                if slot.material is not None:
+                    textured.append(slot.material.name)
+                    col = tuple(slot.material.diffuse_color[:3])
+                else:
+                    col = (0.8, 0.8, 0.8)
+            mat_cols[i] = col
+        if textured:
+            log(f'WARNING: non-flat Base Color in {textured} — used viewport diffuse colour instead')
+            self.report({'WARNING'}, f'{len(textured)} material(s) not flat, used viewport colour: {", ".join(textured[:3])}')
+        log(f'{n_slots} material slots')
+
+        yield ('Unwrapping...', 8)
+        t_uv = time.time()
+        uvl = me.uv_layers.get(self._UV_NAME) or me.uv_layers.new(name=self._UV_NAME)
+        me.uv_layers.active = uvl
+        uvl.active_render = True
+
+        if self.uv_method == 'MATERIAL':
+            n_seams = self._mark_material_seams(me, math.radians(self.angle_limit_deg))
+            log(f'Marked {n_seams} seams (material borders + sharp edges)')
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.reveal()
+            bpy.ops.mesh.select_all(action='SELECT')
+            try:
+                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=max(self.island_margin, 0.002),
+                                  correct_aspect=True)
+            except (RuntimeError, TypeError) as e:
+                log(f'Angle-based unwrap failed ({e}), falling back to Smart UV Project')
+                bpy.ops.uv.smart_project(angle_limit=math.radians(self.angle_limit_deg),
+                                         island_margin=self.island_margin,
+                                         correct_aspect=True, scale_to_bounds=False)
+            bpy.ops.object.mode_set(mode='OBJECT')
+        else:
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.reveal()
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.uv.smart_project(angle_limit=math.radians(self.angle_limit_deg),
+                                     island_margin=self.island_margin,
+                                     correct_aspect=True, scale_to_bounds=False)
+            bpy.ops.object.mode_set(mode='OBJECT')
+        log(f'Unwrap done in {time.time() - t_uv:.1f}s')
+
+        yield ('Gathering triangles...', 25)
+        me.calc_loop_triangles()
+        n_tris = len(me.loop_triangles)
+        n_loops = len(me.loops)
+        if n_tris == 0:
+            raise RuntimeError('Mesh has no triangles')
+
+        uvs = np.empty(n_loops * 2, dtype=np.float32)
+        me.uv_layers[self._UV_NAME].data.foreach_get('uv', uvs)
+        uvs = uvs.reshape(n_loops, 2)
+
+        tri_loops = np.empty(n_tris * 3, dtype=np.int32)
+        me.loop_triangles.foreach_get('loops', tri_loops)
+        tri_poly = np.empty(n_tris, dtype=np.int32)
+        me.loop_triangles.foreach_get('polygon_index', tri_poly)
+        poly_mat = np.empty(len(me.polygons), dtype=np.int32)
+        me.polygons.foreach_get('material_index', poly_mat)
+        tri_mat = np.clip(poly_mat[tri_poly], 0, n_slots - 1)
+
+        # pixel-space triangle corners; image row 0 is v=0
+        P = uvs[tri_loops].reshape(n_tris, 3, 2) * res
+
+        # colours stored either linear (Non-Color) or sRGB-encoded (sRGB texture)
+        if self.exact_roundtrip:
+            store_cols = np.clip(mat_cols, 0.0, 1.0)
+        else:
+            a = np.clip(mat_cols, 0.0, 1.0)
+            store_cols = np.where(a <= 0.0031308, a * 12.92, 1.055 * np.power(a, 1.0 / 2.4) - 0.055)
+        store_cols = store_cols.astype(np.float32)
+
+        yield (f'Rasterizing {n_tris} triangles...', 30)
+        t_ras = time.time()
+        buf = np.zeros((res, res, 3), dtype=np.float32)
+        filled = np.zeros((res, res), dtype=bool)
+
+        # conservative: bbox grown by 1px, edge tests relaxed by half a texel, so every face
+        # keeps a half-pixel halo of its own colour and never samples a neighbour's colour
+        grow = 1.0 + self.conservative_px
+        x0a = np.clip(np.floor(P[:, :, 0].min(axis=1) - grow).astype(np.int32), 0, res - 1)
+        x1a = np.clip(np.ceil(P[:, :, 0].max(axis=1) + grow).astype(np.int32), 0, res - 1)
+        y0a = np.clip(np.floor(P[:, :, 1].min(axis=1) - grow).astype(np.int32), 0, res - 1)
+        y1a = np.clip(np.ceil(P[:, :, 1].max(axis=1) + grow).astype(np.int32), 0, res - 1)
+
+        chunk = max(5000, n_tris // 30)
+        pad = float(self.conservative_px)
+        for start in range(0, n_tris, chunk):
+            end = min(start + chunk, n_tris)
+            for t in range(start, end):
+                col = store_cols[tri_mat[t]]
+                x0, x1, y0, y1 = int(x0a[t]), int(x1a[t]), int(y0a[t]), int(y1a[t])
+                ax, ay = P[t, 0]; bx, by = P[t, 1]; cx, cy = P[t, 2]
+                d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+                hit = False
+                if abs(d) > 1e-9:
+                    ad = abs(d)
+                    # barycentric w_i is a scaled distance to the opposite edge:
+                    # dist_i = w_i * |d| / |edge_i|, so a `pad` texel margin is w_i >= -pad*|edge_i|/|d|
+                    tol0 = pad * math.hypot(bx - cx, by - cy) / ad
+                    tol1 = pad * math.hypot(cx - ax, cy - ay) / ad
+                    tol2 = pad * math.hypot(ax - bx, ay - by) / ad
+                    gx = np.arange(x0, x1 + 1, dtype=np.float32) + 0.5
+                    gy = (np.arange(y0, y1 + 1, dtype=np.float32) + 0.5)[:, None]
+                    w0 = ((by - cy) * (gx - cx) + (cx - bx) * (gy - cy)) / d
+                    w1 = ((cy - ay) * (gx - cx) + (ax - cx) * (gy - cy)) / d
+                    m = (w0 >= -tol0) & (w1 >= -tol1) & ((w0 + w1) <= 1.0 + tol2)
+                    if m.any():
+                        buf[y0:y1 + 1, x0:x1 + 1][m] = col
+                        filled[y0:y1 + 1, x0:x1 + 1][m] = True
+                        hit = True
+                if not hit:
+                    # degenerate / sub-pixel sliver: stamp its corners so it is never invisible
+                    for vx, vy in ((ax, ay), (bx, by), (cx, cy),
+                                   ((ax + bx + cx) / 3.0, (ay + by + cy) / 3.0)):
+                        px = min(res - 1, max(0, int(vx)))
+                        py = min(res - 1, max(0, int(vy)))
+                        buf[py, px] = col
+                        filled[py, px] = True
+            pct = 30 + int(45 * end / n_tris)
+            yield (f'Rasterizing {end}/{n_tris} triangles...', pct)
+        log(f'Rasterized in {time.time() - t_ras:.1f}s, coverage {filled.mean() * 100:.1f}%')
+
+        core = filled.copy()   # pixels actually covered by a face — must stay bit-exact
+        shifts = (((1,), (0,)), ((-1,), (0,)), ((1,), (1,)), ((-1,), (1,)))
+
+        if self.dilate_px > 0:
+            yield ('Padding edges...', 78)
+            for _ in range(self.dilate_px):
+                if filled.all():
+                    break
+                grown = filled.copy()
+                for sh, ax_ in shifts:
+                    src_f = np.roll(filled, sh, axis=ax_)
+                    src_c = np.roll(buf, sh, axis=ax_)
+                    m = (~grown) & src_f
+                    if m.any():
+                        buf[m] = src_c[m]
+                        grown |= m
+                filled = grown
+
+        if self.pad_blur > 0:
+            pad_mask = filled & ~core
+            if pad_mask.any():
+                yield ('Blurring padding...', 82)
+                w = filled.astype(np.float32)
+                for _ in range(self.pad_blur):
+                    weighted = buf * w[:, :, None]
+                    acc = weighted.copy()
+                    cnt = w.copy()
+                    for sh, ax_ in shifts:
+                        acc += np.roll(weighted, sh, axis=ax_)
+                        cnt += np.roll(w, sh, axis=ax_)
+                    blurred = acc / np.maximum(cnt, 1e-6)[:, :, None]
+                    buf[pad_mask] = blurred[pad_mask]
+
+        yield ('Writing image...', 85)
+        img_name = f'EBC_Baked_{src_obj.name}'
+        img = bpy.data.images.new(img_name, res, res, alpha=False, float_buffer=False)
+        img.colorspace_settings.name = 'Non-Color' if self.exact_roundtrip else 'sRGB'
+        pix = np.empty((res, res, 4), dtype=np.float32)
+        pix[:, :, :3] = buf
+        pix[:, :, 3] = 1.0
+        img.pixels.foreach_set(pix.ravel())
+        img.update()
+        try: img.pack()
+        except Exception as e: log(f'pack failed: {e}')
+
+        yield ('Building material...', 92)
+        mat = bpy.data.materials.new(f'EBC_Baked_{src_obj.name}')
+        mat.use_nodes = True
+        nt = mat.node_tree
+        bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        tex = nt.nodes.new('ShaderNodeTexImage')
+        tex.image = img
+        tex.interpolation = 'Closest'   # flat colours: no blending across island borders
+        if bsdf is not None:
+            tex.location = (bsdf.location.x - 400, bsdf.location.y)
+            nt.links.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
+        me.materials.clear()
+        me.materials.append(mat)
+        me.polygons.foreach_set('material_index', np.zeros(len(me.polygons), dtype=np.int32))
+        me.update()
+
+        if self.setup_ebc_modifier:
+            yield ('Wiring EBC modifier...', 96)
+            if 'KIRI_Edit_By_Colour_GN' not in obj.modifiers:
+                sna_add_edit_by_colour_modifier_function_execute_7A473()
+            mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN')
+            if mod is not None:
+                mod['Socket_2'] = self._UV_NAME
+                mod['Socket_4'] = img
+                obj.update_tag(refresh={'DATA'})
+
+        elapsed = time.time() - t_start
+        log(f'=== Bake finished in {elapsed:.1f}s → {obj.name} / {img_name} ===')
+        yield (f'Done in {elapsed:.0f}s — {obj.name}', 100)
+
 
 class SNA_OT_test_progressive_separate(bpy.types.Operator):
     bl_idname = 'sna.test_progressive_separate'
@@ -4635,6 +5159,22 @@ def sna_palette_split_interface(layout_function):
                  icon_value=string_to_icon('MOD_EXPLODE'))
 
 
+def sna_bake_materials_interface(layout_function):
+    box = layout_function.box()
+    box.label(text='Bake Materials to Texture', icon_value=string_to_icon('TEXTURE'))
+    obj = bpy.context.view_layer.objects.active
+    if obj is None or obj.type != 'MESH':
+        box.label(text='Select a mesh object', icon_value=0)
+        return
+    n_mats = len(obj.material_slots)
+    if n_mats == 0:
+        box.label(text='Mesh has no materials', icon_value=0)
+        return
+    box.label(text=f'{n_mats} material slots → 1 texture', icon_value=0)
+    box.operator('sna.bake_materials_to_texture', text='Bake Materials → Texture',
+                 icon_value=string_to_icon('RENDER_STILL'))
+
+
 def register():
     global _icons
     _icons = bpy.utils.previews.new()
@@ -4681,6 +5221,7 @@ def register():
     bpy.utils.register_class(SNA_OT_test_merge_islands)
     bpy.utils.register_class(SNA_OT_voxel_block_remesh)
     bpy.utils.register_class(SNA_OT_test_voxel_block_remesh)
+    bpy.utils.register_class(SNA_OT_bake_materials_to_texture)
     bpy.types.Scene.sna_palette_colors = bpy.props.CollectionProperty(type=SNA_PaletteColorItem)
     bpy.types.Scene.sna_palette_active_index = bpy.props.IntProperty(default=0)
 
@@ -4728,6 +5269,7 @@ def unregister():
     del bpy.types.Scene.sna_palette_active_index
     del bpy.types.Scene.sna_palette_colors
     bpy.utils.unregister_class(SNA_OT_test_merge_islands)
+    bpy.utils.unregister_class(SNA_OT_bake_materials_to_texture)
     bpy.utils.unregister_class(SNA_OT_test_voxel_block_remesh)
     bpy.utils.unregister_class(SNA_OT_voxel_block_remesh)
     bpy.utils.unregister_class(SNA_OT_test_progressive_separate)
