@@ -3691,7 +3691,22 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
     _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=350)
+        return context.window_manager.invoke_props_dialog(self, width=400)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        col = layout.column()
+        col.prop(self, 'cell_size_mm')
+        col.prop(self, 'num_colors')
+        col.prop(self, 'cap_side')
+        col.prop(self, 'wall_cells')
+        col.prop(self, 'kmeans_iters')
+        col.prop(self, 'kmeans_subsample')
+        col.prop(self, 'use_hsv')
+        col.prop(self, 'do_separate')
+        col.prop(self, 'remove_original')
 
     def execute(self, context):
         import numpy as np
