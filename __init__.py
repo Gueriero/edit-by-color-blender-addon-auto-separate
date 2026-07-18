@@ -3650,21 +3650,6 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         name='Total Colors', default=16, min=2, max=256,
         description='Number of palette colors (K for k-means). Each color becomes one material',
     )
-    cap_side: bpy.props.EnumProperty(
-        name='Cap Open Side', default='NONE',
-        items=[('NONE', 'None (mesh is closed)', 'Flood exterior from all 6 sides. For watertight meshes', 0, 0),
-               ('Z_NEG', 'Bottom (-Z)', 'Seal the bottom grid face', 0, 1),
-               ('Z_POS', 'Top (+Z)', 'Seal the top grid face', 0, 2),
-               ('Y_NEG', 'Back (-Y)', 'Seal the back grid face. Typical for a relief with an open back', 0, 3),
-               ('Y_POS', 'Front (+Y)', 'Seal the front grid face', 0, 4),
-               ('X_NEG', 'Left (-X)', 'Seal the left grid face', 0, 5),
-               ('X_POS', 'Right (+X)', 'Seal the right grid face', 0, 6)],
-        description='Grid face excluded from exterior flood fill — the volume behind it becomes interior',
-    )
-    wall_cells: bpy.props.IntProperty(
-        name='Wall Thickness (cells)', default=0, min=0, max=20,
-        description='0 = solid fill. N > 0 = fill N cells inward from surface, core stays hollow',
-    )
     kmeans_iters: bpy.props.IntProperty(
         name='K-means Iterations', default=20, min=2, max=100,
     )
@@ -3688,21 +3673,20 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
     _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
     def invoke(self, context, event):
-        # invoke_props_popup always calls draw() — unlike invoke_props_dialog which
-        # may fall back to RNA auto-layout and silently skip newly added props
-        return context.window_manager.invoke_props_popup(self, event)
+        return context.window_manager.invoke_props_dialog(self, width=420)
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(self, 'cell_size_mm')
-        layout.prop(self, 'num_colors')
-        layout.prop(self, 'cap_side')
-        layout.prop(self, 'wall_cells')
-        layout.prop(self, 'kmeans_iters')
-        layout.prop(self, 'kmeans_subsample')
-        layout.prop(self, 'use_hsv')
-        layout.prop(self, 'do_separate')
-        layout.prop(self, 'remove_original')
+        col = layout.column(align=True)
+        col.prop(self, 'cell_size_mm')
+        col.prop(self, 'num_colors')
+        col.prop(context.scene, 'sna_voxel_cap_side')
+        col.prop(context.scene, 'sna_voxel_wall_cells')
+        col.prop(self, 'kmeans_iters')
+        col.prop(self, 'kmeans_subsample')
+        col.prop(self, 'use_hsv')
+        col.prop(self, 'do_separate')
+        col.prop(self, 'remove_original')
 
     def execute(self, context):
         import numpy as np
@@ -3982,7 +3966,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         # Seed exterior from the grid faces (border is air thanks to bbox margin). A capped side is
         # left unseeded: on an open mesh (relief with no back) air otherwise walks in through the
         # opening, nothing is enclosed, and the result is a one-cell shell.
-        cap = self.cap_side
+        cap = context.scene.sna_voxel_cap_side
         exterior = np.zeros_like(occ)
         if cap != 'X_NEG': exterior[0, :, :]  |= free[0, :, :]
         if cap != 'X_POS': exterior[-1, :, :] |= free[-1, :, :]
@@ -4012,10 +3996,11 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             if it % 20 == 0:
                 yield (f'Flood fill pass {it} ({cnt} exterior cells)...', 18)
         interior = free & ~exterior
-        if self.wall_cells > 0:
+        wall = context.scene.sna_voxel_wall_cells
+        if wall > 0:
             # keep the core hollow: occupy only the interior cells within N steps of the surface
             grow = occ.copy()
-            for _ in range(self.wall_cells):
+            for _ in range(wall):
                 nxt = grow.copy()
                 nxt[1:, :, :]  |= grow[:-1, :, :]
                 nxt[:-1, :, :] |= grow[1:, :, :]
@@ -4032,7 +4017,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         occ |= to_fill
         n_filled = int(to_fill.sum())
         n_occupied = int(occ.sum())
-        mode = 'solid' if self.wall_cells == 0 else f'{self.wall_cells}-cell wall'
+        mode = 'solid' if wall == 0 else f'{wall}-cell wall'
         log(f'Interior fill (flood, cap={cap}, {mode}): +{n_filled} cells in {it} passes, '
             f'total {n_occupied} occupied, in {time.time() - t_fill:.1f}s')
         if n_filled < n_occupied // 100 and cap == 'NONE':
@@ -5144,6 +5129,9 @@ def sna_voxel_block_remesh_interface(layout_function):
     obj = bpy.context.view_layer.objects.active
     mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN') if obj else None
     if mod is not None:
+        col = box.column(align=True)
+        col.prop(bpy.context.scene, 'sna_voxel_cap_side')
+        col.prop(bpy.context.scene, 'sna_voxel_wall_cells')
         box.operator('sna.voxel_block_remesh', text='Voxel Remesh & Colorize',
                      icon_value=string_to_icon('MOD_BUILD'))
     else:
@@ -5235,6 +5223,19 @@ def register():
     bpy.utils.register_class(SNA_OT_bake_materials_to_texture)
     bpy.types.Scene.sna_palette_colors = bpy.props.CollectionProperty(type=SNA_PaletteColorItem)
     bpy.types.Scene.sna_palette_active_index = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.sna_voxel_cap_side = bpy.props.EnumProperty(
+        name='Cap Open Side', default='NONE',
+        items=[('NONE', 'None (mesh is closed)', 'Flood exterior from all 6 sides. For watertight meshes', 0, 0),
+               ('Z_NEG', 'Bottom (-Z)', 'Seal the bottom grid face', 0, 1),
+               ('Z_POS', 'Top (+Z)', 'Seal the top grid face', 0, 2),
+               ('Y_NEG', 'Back (-Y)', 'Seal the back grid face. Typical for a relief with an open back', 0, 3),
+               ('Y_POS', 'Front (+Y)', 'Seal the front grid face', 0, 4),
+               ('X_NEG', 'Left (-X)', 'Seal the left grid face', 0, 5),
+               ('X_POS', 'Right (+X)', 'Seal the right grid face', 0, 6)],
+        description='Grid face excluded from exterior flood fill — the volume behind it becomes interior')
+    bpy.types.Scene.sna_voxel_wall_cells = bpy.props.IntProperty(
+        name='Wall Thickness (cells)', default=0, min=0, max=20,
+        description='0 = solid fill. N > 0 = fill N cells inward from surface, core stays hollow')
 
 
 def unregister():
@@ -5277,6 +5278,8 @@ def unregister():
     bpy.utils.unregister_class(SNA_OT_Bake_To_Patch_Fa828)
     bpy.utils.unregister_class(SNA_OT_Add_Bake_Patch_68526)
     bpy.utils.unregister_class(SNA_OT_Link_Baked_Textures_Patch_067F8)
+    del bpy.types.Scene.sna_voxel_wall_cells
+    del bpy.types.Scene.sna_voxel_cap_side
     del bpy.types.Scene.sna_palette_active_index
     del bpy.types.Scene.sna_palette_colors
     bpy.utils.unregister_class(SNA_OT_test_merge_islands)
