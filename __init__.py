@@ -3652,21 +3652,18 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
     )
     cap_side: bpy.props.EnumProperty(
         name='Cap Open Side', default='NONE',
-        items=[('NONE', 'None (mesh is closed)', 'Flood the exterior from all 6 grid faces. Correct for a watertight mesh', 0, 0),
-               ('Z_NEG', 'Bottom (-Z)', 'Treat the bottom of the grid as sealed', 0, 1),
-               ('Z_POS', 'Top (+Z)', 'Treat the top of the grid as sealed', 0, 2),
-               ('Y_NEG', 'Back (-Y)', 'Treat the back of the grid as sealed. Typical for a relief with an open back', 0, 3),
-               ('Y_POS', 'Front (+Y)', 'Treat the front of the grid as sealed', 0, 4),
-               ('X_NEG', 'Left (-X)', 'Treat the -X side of the grid as sealed', 0, 5),
-               ('X_POS', 'Right (+X)', 'Treat the +X side of the grid as sealed', 0, 6)],
-        description=('Which grid face NOT to seed the exterior flood fill from. An open mesh (relief with no back, '
-                     'model cut off at the bottom) lets air walk inside through the opening, so nothing counts as '
-                     'interior and the result is a one-cell shell. Sealing the open side makes the volume fill up'),
+        items=[('NONE', 'None (mesh is closed)', 'Flood exterior from all 6 sides. For watertight meshes', 0, 0),
+               ('Z_NEG', 'Bottom (-Z)', 'Seal the bottom grid face', 0, 1),
+               ('Z_POS', 'Top (+Z)', 'Seal the top grid face', 0, 2),
+               ('Y_NEG', 'Back (-Y)', 'Seal the back grid face. Typical for a relief with an open back', 0, 3),
+               ('Y_POS', 'Front (+Y)', 'Seal the front grid face', 0, 4),
+               ('X_NEG', 'Left (-X)', 'Seal the left grid face', 0, 5),
+               ('X_POS', 'Right (+X)', 'Seal the right grid face', 0, 6)],
+        description='Grid face excluded from exterior flood fill — the volume behind it becomes interior',
     )
     wall_cells: bpy.props.IntProperty(
         name='Wall Thickness (cells)', default=0, min=0, max=20,
-        description=('0 = fill the whole interior (solid). N > 0 = fill only N cells inward from the surface, '
-                     'leaving the core hollow. Needs an interior to exist, so pair it with Cap Open Side on an open mesh'),
+        description='0 = solid fill. N > 0 = fill N cells inward from surface, core stays hollow',
     )
     kmeans_iters: bpy.props.IntProperty(
         name='K-means Iterations', default=20, min=2, max=100,
@@ -3691,22 +3688,21 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
     _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=400)
+        # invoke_props_popup always calls draw() — unlike invoke_props_dialog which
+        # may fall back to RNA auto-layout and silently skip newly added props
+        return context.window_manager.invoke_props_popup(self, event)
 
     def draw(self, context):
         layout = self.layout
-        layout.use_property_split = True
-        layout.use_property_decorate = False
-        col = layout.column()
-        col.prop(self, 'cell_size_mm')
-        col.prop(self, 'num_colors')
-        col.prop(self, 'cap_side')
-        col.prop(self, 'wall_cells')
-        col.prop(self, 'kmeans_iters')
-        col.prop(self, 'kmeans_subsample')
-        col.prop(self, 'use_hsv')
-        col.prop(self, 'do_separate')
-        col.prop(self, 'remove_original')
+        layout.prop(self, 'cell_size_mm')
+        layout.prop(self, 'num_colors')
+        layout.prop(self, 'cap_side')
+        layout.prop(self, 'wall_cells')
+        layout.prop(self, 'kmeans_iters')
+        layout.prop(self, 'kmeans_subsample')
+        layout.prop(self, 'use_hsv')
+        layout.prop(self, 'do_separate')
+        layout.prop(self, 'remove_original')
 
     def execute(self, context):
         import numpy as np
