@@ -3878,70 +3878,123 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
 
         yield (f'Grid: {grid_size_x}×{grid_size_y}×{grid_size_z} = {total_cells} cells', 3)
 
-        # Phase 3: Voxel occupancy via vertex seeding + BVH verification
-        # 1. Seed cells from every mesh vertex (guaranteed occupied)
-        # 2. 2-ring expand to get surface band
-        # 3. BVH find_nearest per band cell to verify surface proximity
+        # Phase 3: Voxel occupancy via face rasterization + vertex seeding + BVH verify.
+        # Large faces with vertices far apart (many cell_sizes) were missed by the old
+        # vertex-only seed: a 20mm face with 5mm cells has no vertex within 2 rings of
+        # its centre. Now we rasterize every triangle onto the cell grid so every face,
+        # regardless of vertex-spacing, seeds cells across its entire surface.
         half_diag = cell_size * math.sqrt(3) * 0.5
         log(f'Voxel grid: half_diag={half_diag*1000:.2f}mm')
-        yield ('Seeding cells from mesh vertices...', 5)
+        yield ('Rasterizing faces onto cell grid...', 5)
         t_occ = time.time()
 
         occupied = set()
-        # Step 1: vertex seeding
-        for vi in range(n_verts):
-            v = verts_world[vi]
-            ix = int((v[0] - bbox_min[0]) / cell_size)
-            iy = int((v[1] - bbox_min[1]) / cell_size)
-            iz = int((v[2] - bbox_min[2]) / cell_size)
+
+        def _add(ix, iy, iz):
             if 0 <= ix < grid_size_x and 0 <= iy < grid_size_y and 0 <= iz < grid_size_z:
                 occupied.add((ix, iy, iz))
+
+        # Step 1: vertex seeding (cheap, always do)
+        for vi in range(n_verts):
+            v = verts_world[vi]
+            _add(int((v[0] - bbox_min[0]) / cell_size),
+                 int((v[1] - bbox_min[1]) / cell_size),
+                 int((v[2] - bbox_min[2]) / cell_size))
         log(f'Vertex seeds: {len(occupied)} cells, in {time.time() - t_occ:.1f}s')
         yield (f'{len(occupied)} vertex cells', 8)
 
-        # Step 2: 1-ring expand
+        # Step 2: rasterize each triangle onto the cell grid (fills large faces).
+        # Pick the projection plane (drop the coordinate with the largest normal comp.)
+        # to keep the 2×2 barycentric determinant well-conditioned.  Then check the
+        # interpolated drop-coordinate so the cell centre truly lies on the triangle
+        # plane — not just under its 2D shadow.
+        rast_total = 0
+        proj_table = [(1, 2), (2, 0), (0, 1)]  # ax0, ax1 for drop = 0, 1, 2
+        for poly in obj.data.polygons:
+            pv = [verts_world[vi] for vi in poly.vertices]
+            for ti in range(1, len(pv) - 1):
+                a, b_vec, c_vec = pv[0], pv[ti], pv[ti + 1]
+                ia = np.array([(a[k] - bbox_min[k]) / cell_size for k in range(3)], dtype=np.float32)
+                ib = np.array([(b_vec[k] - bbox_min[k]) / cell_size for k in range(3)], dtype=np.float32)
+                ic = np.array([(c_vec[k] - bbox_min[k]) / cell_size for k in range(3)], dtype=np.float32)
+
+                normal = np.cross(ib - ia, ic - ia)
+                drop = int(np.argmax(np.abs(normal)))
+                ax0, ax1 = proj_table[drop]
+
+                mn = np.maximum(0, np.floor(np.minimum(np.minimum(ia, ib), ic)).astype(np.int32) - 1)
+                mx = np.minimum([grid_size_x - 1, grid_size_y - 1, grid_size_z - 1],
+                                np.ceil(np.maximum(np.maximum(ia, ib), ic)).astype(np.int32) + 1)
+                if mx[0] < mn[0] or mx[1] < mn[1] or mx[2] < mn[2]:
+                    continue
+
+                # 2×2 determinant in the projection plane
+                d = ((ib[ax1] - ic[ax1]) * (ia[ax0] - ic[ax0])
+                     + (ic[ax0] - ib[ax0]) * (ia[ax1] - ic[ax1]))
+                if abs(d) < 1e-12:
+                    continue
+
+                inner, mid, outer = ax0, ax1, drop
+                step0 = (ib[ax1] - ic[ax1]) / d
+                step1 = (ic[ax1] - ia[ax1]) / d
+                # precomputed drop-coordinate for the third vertex (w = 1 - w0 - w1)
+                drA, drB, drC = float(ia[drop]), float(ib[drop]), float(ic[drop])
+
+                ic_mid, ic_inner = ic[mid], ic[inner]
+
+                for i_outer in range(int(mn[outer]), int(mx[outer]) + 1):
+                    co = float(i_outer) + 0.5
+                    for i_mid in range(int(mn[mid]), int(mx[mid]) + 1):
+                        cm = float(i_mid) + 0.5
+                        ci0 = mn[inner] + 0.5 - ic_inner
+                        dy = cm - ic_mid
+                        w0 = ((ib[ax1] - ic[ax1]) * ci0 + (ic[ax0] - ib[ax0]) * dy) / d
+                        w1 = ((ic[ax1] - ia[ax1]) * ci0 + (ia[ax0] - ic[ax0]) * dy) / d
+                        for i_inner in range(int(mn[inner]), int(mx[inner]) + 1):
+                            if w0 >= -1e-6 and w1 >= -1e-6 and (w0 + w1) <= 1.0 + 1e-6:
+                                # 3D barycentric interpolation of dropped axis
+                                w2 = 1.0 - w0 - w1
+                                plane_drop = drA * w0 + drB * w1 + drC * w2
+                                if abs(co - plane_drop) <= 0.5001:
+                                    ix = i_inner if inner == 0 else (i_outer if outer == 0 else i_mid)
+                                    iy = i_inner if inner == 1 else (i_outer if outer == 1 else i_mid)
+                                    iz = i_inner if inner == 2 else (i_outer if outer == 2 else i_mid)
+                                    _add(ix, iy, iz)
+                                    rast_total += 1
+                            w0 += step0
+                            w1 += step1
+            if len(occupied) % 50000 == 0:
+                yield (f'Rasterizing faces ({len(occupied)} cells)...', 10)
+        log(f'Face rasterization: +{rast_total} cells')
+        yield (f'{len(occupied)} cells after face rasterization', 12)
+
+        # Step 3: 1-ring expand — fill small cracks between face-triangle edges
         seeds = list(occupied)
         for (ix, iy, iz) in seeds:
             for dx, dy, dz in DIRS:
-                nx, ny, nz = ix + dx, iy + dy, iz + dz
-                if 0 <= nx < grid_size_x and 0 <= ny < grid_size_y and 0 <= nz < grid_size_z:
-                    occupied.add((nx, ny, nz))
-        band1 = list(occupied - set(seeds))
+                _add(ix + dx, iy + dy, iz + dz)
         log(f'1-ring expand: {len(occupied)} cells')
-        yield (f'{len(occupied)} cells after 1-ring expand', 10)
+        yield (f'{len(occupied)} cells after 1-ring expand', 14)
 
-        # Step 3: 2-ring expand (candidates for BVH check)
-        candidates = set()
-        for (ix, iy, iz) in band1:
+        # Step 4: BVH verification pass — catch cells the rasterizer missed
+        # (near-vertical faces whose cell bbox collapses, thin wires, etc.)
+        verified = 0
+        rejected = 0
+        for (ix, iy, iz) in list(occupied):
             for dx, dy, dz in DIRS:
                 nx, ny, nz = ix + dx, iy + dy, iz + dz
                 if 0 <= nx < grid_size_x and 0 <= ny < grid_size_y and 0 <= nz < grid_size_z:
                     nk = (nx, ny, nz)
                     if nk not in occupied:
-                        candidates.add(nk)
-        log(f'2-ring candidates: {len(candidates)} cells')
-        yield (f'{len(candidates)} BVH candidates', 12)
-
-        # Step 4: BVH verify each candidate
-        verified = 0
-        rejected = 0
-        cand_list = list(candidates)
-        chunk = 10000
-        for ci, start in enumerate(range(0, len(cand_list), chunk)):
-            end = min(start + chunk, len(cand_list))
-            for i in range(start, end):
-                ix, iy, iz = cand_list[i]
-                cx = bbox_min[0] + (ix + 0.5) * cell_size
-                cy = bbox_min[1] + (iy + 0.5) * cell_size
-                cz = bbox_min[2] + (iz + 0.5) * cell_size
-                nearest = bvh.find_nearest(mathutils.Vector((cx, cy, cz)))
-                if nearest is not None and nearest[3] < half_diag:
-                    occupied.add((ix, iy, iz))
-                    verified += 1
-                else:
-                    rejected += 1
-            pct = 12 + int(5 * (ci + 1) / max(1, (len(cand_list) + chunk - 1) // chunk))
-            yield (f'BVH verifying {end}/{len(cand_list)} (+{verified}/-{rejected})', pct)
+                        cx = bbox_min[0] + (nx + 0.5) * cell_size
+                        cy = bbox_min[1] + (ny + 0.5) * cell_size
+                        cz = bbox_min[2] + (nz + 0.5) * cell_size
+                        nearest = bvh.find_nearest(mathutils.Vector((cx, cy, cz)))
+                        if nearest is not None and nearest[3] < half_diag:
+                            occupied.add(nk)
+                            verified += 1
+                        else:
+                            rejected += 1
 
         log(f'BVH verified: +{verified} -{rejected}, total occupied={len(occupied)} in {time.time() - t_occ:.1f}s')
         yield (f'{len(occupied)} occupied cells (+{verified} BVH verified)', 17)
