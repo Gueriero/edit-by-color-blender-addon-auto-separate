@@ -4380,7 +4380,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         # Create new mesh object for the result; name carries the settings so the outliner
         # shows at a glance which run produced which mesh: <mode>_<cell>mm_K<colors>_<src>_Voxel
         mode = 'HSV' if self.use_hsv else 'sRGB'
-        res_name = f'{mode}_{self.cell_size_mm:g}mm_K{len(cluster_mats)}_{obj.name}_Voxel'
+        res_name = f'{mode}_{self.cell_size_mm:g}mm_K{len(cluster_mats)}_g{self.color_gamma:g}_{obj.name}_Voxel'
         result_mesh = bpy.data.meshes.new(res_name)
         result_obj = bpy.data.objects.new(res_name, result_mesh)
         context.collection.objects.link(result_obj)
