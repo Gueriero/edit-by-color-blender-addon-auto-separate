@@ -3673,6 +3673,10 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         name='Merge Cube Vertices', default=True,
         description='Weld coincident vertices between adjacent cubes into one connected mesh',
     )
+    color_gamma: bpy.props.FloatProperty(
+        name='Gamma', default=1.0, min=0.1, max=10.0, precision=2, step=1,
+        description='Color gamma on sampled face colors: 1 = as-is, >1 = darker, <1 = lighter',
+    )
 
     _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
@@ -3796,6 +3800,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         layout.prop(self, 'do_separate')
         layout.prop(self, 'remove_original')
         layout.prop(self, 'merge_verts')
+        layout.prop(self, 'color_gamma')
         col = layout.column(align=True)
         col.label(text='Relief (open plane, no back wall):')
         col.prop(context.scene, 'sna_voxel_relief_thickness_mm')
@@ -4245,6 +4250,9 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                 yield (f'Sampling colors {fi}/{len(faces_to_emit)}...', pct)
 
         log(f'Color sampling done in {time.time() - t_color:.1f}s')
+        if self.color_gamma != 1.0:
+            face_colors = np.clip(face_colors, 0.0, 1.0) ** self.color_gamma
+            log(f'Gamma {self.color_gamma:.2f} applied to face colors (mean={float(face_colors.mean()):.4f})')
         yield (f'Colors sampled ({len(faces_to_emit)} faces)', 40)
 
         # Phase 6: K-means palette
