@@ -3669,6 +3669,10 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         name='Remove Original', default=False,
         description='Remove the source mesh object after the remesh is built',
     )
+    merge_verts: bpy.props.BoolProperty(
+        name='Merge Cube Vertices', default=True,
+        description='Weld coincident vertices between adjacent cubes into one connected mesh',
+    )
 
     _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
@@ -3791,6 +3795,11 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         layout.prop(self, 'use_hsv')
         layout.prop(self, 'do_separate')
         layout.prop(self, 'remove_original')
+        layout.prop(self, 'merge_verts')
+        col = layout.column(align=True)
+        col.label(text='Relief (open plane, no back wall):')
+        col.prop(context.scene, 'sna_voxel_relief_thickness_mm')
+        col.prop(context.scene, 'sna_voxel_relief_back')
         col = layout.column(align=True)
         col.label(text='Advanced:')
         col.prop(self, 'kmeans_iters')
@@ -3865,6 +3874,26 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         cell_size = self.cell_size_mm / 1000.0  # mm → meters (Blender units)
         log(f'Voxel grid: cell_size={self.cell_size_mm:.1f}mm ({cell_size:.4f}m)')
 
+        # Relief mode: solid N cell layers behind the surface (open relief plane, no back
+        # wall). Resolve the back direction here, before the grid, so the grid can grow that way.
+        relief_n = 0
+        relief_back = -1  # -1 = thickness toward -Y, +1 = toward +Y
+        thickness_mm = context.scene.sna_voxel_relief_thickness_mm
+        if thickness_mm > 0:
+            relief_n = max(1, int(round(thickness_mm / self.cell_size_mm)))
+            side = context.scene.sna_voxel_relief_back
+            if side == 'AUTO':
+                nrm = np.empty(n_polys * 3, dtype=np.float32)
+                mesh.polygons.foreach_get('normal', nrm)
+                mean_y = float((nrm.reshape(-1, 3) @ M[:3, :3].T)[:, 1].mean())
+                relief_back = -1 if mean_y >= 0 else 1
+                log(f'Relief AUTO: mean world normal y={mean_y:.4f} -> thickness toward '
+                    f'{"-Y" if relief_back < 0 else "+Y"}')
+            else:
+                relief_back = -1 if side == 'Y_NEG' else 1
+            log(f'Relief mode: thickness={thickness_mm:.1f}mm = {relief_n} cell(s), '
+                f'direction {"-Y" if relief_back < 0 else "+Y"}')
+
         # Axis-aligned bounding box with margin
         bbox_min = np.min(verts_world, axis=0) - cell_size
         bbox_max = np.max(verts_world, axis=0) + cell_size
@@ -3873,6 +3902,13 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         grid_size_y = int(np.ceil((bbox_max[1] - bbox_min[1]) / cell_size))
         grid_size_z = int(np.ceil((bbox_max[2] - bbox_min[2]) / cell_size))
         bbox_max = bbox_min + np.array([grid_size_x, grid_size_y, grid_size_z], dtype=np.float32) * cell_size
+        if relief_n > 0:
+            # grow the grid toward the back so the thickness layers fit
+            if relief_back < 0:
+                bbox_min[1] -= relief_n * cell_size
+            else:
+                bbox_max[1] += relief_n * cell_size
+            grid_size_y += relief_n
         total_cells = grid_size_x * grid_size_y * grid_size_z
         log(f'Grid: {grid_size_x}×{grid_size_y}×{grid_size_z} = {total_cells} cells, bbox=[{bbox_min}] → [{bbox_max}]')
 
@@ -4015,6 +4051,34 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             idx = np.fromiter((v for cell in occupied for v in cell), dtype=np.int64,
                               count=len(occupied) * 3).reshape(-1, 3)
             occ[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+
+        if relief_n > 0:
+            # Relief column fill: for every (x,z) column solidify along Y from the backmost
+            # to the frontmost surface cell, plus relief_n layers toward the back side.
+            # Column-wise (not flood): an open plane with no back wall encloses nothing, so
+            # flood fill would leave a 1-cell shell. Overhangs (beard over face) get solid
+            # between the front extremes — a monolith, not floating layers.
+            yield ('Filling relief columns along Y...', 18)
+            t_fill = time.time()
+            n_surface = int(occ.sum())
+            has = occ.any(axis=1)  # (gx, gz)
+            if has.any():
+                y_first = np.argmax(occ, axis=1)  # backmost occupied y per column
+                y_last = gy - 1 - np.argmax(occ[:, ::-1, :], axis=1)  # frontmost occupied y
+                if relief_back < 0:  # grow toward -Y: extend below the backmost cell
+                    lo = np.maximum(y_first - relief_n + 1, 0)
+                    hi = y_last
+                else:  # grow toward +Y: extend above the frontmost cell
+                    lo = y_first
+                    hi = np.minimum(y_last + relief_n - 1, gy - 1)
+                yy = np.arange(gy, dtype=np.int32)[None, :, None]
+                fill = (yy >= lo[:, None, :]) & (yy <= hi[:, None, :]) & has[:, None, :]
+                occ |= fill
+            n_filled = int(occ.sum()) - n_surface
+            log(f'Relief column fill: +{n_filled} cells in {time.time() - t_fill:.1f}s, '
+                f'total {int(occ.sum())}')
+            yield (f'{int(occ.sum())} total cells (+{n_filled} relief)', 20)
+
         free = ~occ
         # Seed exterior from the grid faces (border is air thanks to bbox margin). A capped side is
         # left unseeded: on an open mesh (relief with no back) air otherwise walks in through the
@@ -4073,7 +4137,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         mode = 'solid' if wall == 0 else f'{wall}-cell wall'
         log(f'Interior fill (flood, cap={cap}, {mode}): +{n_filled} cells in {it} passes, '
             f'total {n_occupied} occupied, in {time.time() - t_fill:.1f}s')
-        if n_filled < n_occupied // 100 and cap == 'NONE':
+        if n_filled < n_occupied // 100 and cap == 'NONE' and relief_n == 0:
             log('HINT: almost nothing was enclosed — the mesh is probably open. Set Cap Open Side '
                 '(e.g. Back (-Y) for a relief) to fill the volume instead of getting a hollow shell.')
         yield (f'{n_occupied} total cells (+{n_filled} interior filled)', 20)
@@ -4356,6 +4420,15 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             if fi % 20000 == 0 and fi > 0:
                 pct = 62 + int(26 * fi / len(faces_to_emit))
                 yield (f'Building geometry {fi}/{len(faces_to_emit)}...', pct)
+
+        # Weld coincident vertices: each cube face brings its own 4 corners, so adjacent
+        # cube faces create duplicate verts at shared edges. remove_doubles merges them.
+        t_weld = time.time()
+        if self.merge_verts:
+            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=cell_size * 1e-4)
+            log(f'Welded vertices in {time.time() - t_weld:.2f}s ({len(bm.verts)} verts remaining)')
+        else:
+            log(f'Merge Cube Vertices OFF — kept {len(bm.verts)} unwelded verts')
 
         bm.to_mesh(result_mesh)
         bm.free()
@@ -5185,8 +5258,11 @@ def sna_voxel_block_remesh_interface(layout_function):
         col = box.column(align=True)
         col.prop(bpy.context.scene, 'sna_voxel_cap_side')
         col.prop(bpy.context.scene, 'sna_voxel_wall_cells')
-        box.operator('sna.voxel_block_remesh', text='Voxel Remesh & Colorize',
-                     icon_value=string_to_icon('MOD_BUILD'))
+        col.prop(bpy.context.scene, 'sna_voxel_relief_thickness_mm')
+        col.prop(bpy.context.scene, 'sna_voxel_relief_back')
+        op = box.operator('sna.voxel_block_remesh', text='Voxel Remesh & Colorize',
+                          icon_value=string_to_icon('MOD_BUILD'))
+        op.merge_verts = True
     else:
         box.label(text='Add Edit By Colour modifier first', icon_value=0)
     box.operator('sna.test_voxel_block_remesh', text='Self-Test: Voxel Block Remesh',
@@ -5289,6 +5365,17 @@ def register():
     bpy.types.Scene.sna_voxel_wall_cells = bpy.props.IntProperty(
         name='Wall Thickness (cells)', default=0, min=0, max=20,
         description='0 = solid fill. N > 0 = fill N cells inward from surface, core stays hollow')
+    bpy.types.Scene.sna_voxel_relief_thickness_mm = bpy.props.FloatProperty(
+        name='Relief Thickness (mm)', default=0.0, min=0.0, max=500.0,
+        precision=1, step=10,
+        description='Solid relief mode: N layers of cubes behind the surface. Works on open meshes '
+                    'with no back wall (bent relief plane). 0 = off, old behavior')
+    bpy.types.Scene.sna_voxel_relief_back = bpy.props.EnumProperty(
+        name='Relief Back Side', default='Y_NEG',
+        items=[('Y_NEG', '-Y (back)', 'Thickness grows toward -Y', 0, 0),
+               ('Y_POS', '+Y (back)', 'Thickness grows toward +Y', 0, 1),
+               ('AUTO', 'Auto', 'Pick the side opposite the average face normal', 0, 2)],
+        description='Direction the relief thickness grows from the surface')
 
 
 def unregister():
@@ -5333,6 +5420,8 @@ def unregister():
     bpy.utils.unregister_class(SNA_OT_Link_Baked_Textures_Patch_067F8)
     del bpy.types.Scene.sna_voxel_wall_cells
     del bpy.types.Scene.sna_voxel_cap_side
+    del bpy.types.Scene.sna_voxel_relief_back
+    del bpy.types.Scene.sna_voxel_relief_thickness_mm
     del bpy.types.Scene.sna_palette_active_index
     del bpy.types.Scene.sna_palette_colors
     bpy.utils.unregister_class(SNA_OT_test_merge_islands)
