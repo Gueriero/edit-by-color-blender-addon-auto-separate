@@ -3678,6 +3678,11 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         description='After separate by color, close the open boundary edges of each color part '
                     '(seals multi-color voxel shells; caps get the part’s dominant material)',
     )
+    fix_checker: bpy.props.BoolProperty(
+        name='Fix Diagonal Contacts', default=True,
+        description='Fill one of the two empty cells in every diagonal (checkerboard) cell contact, '
+                    'so no edge is shared by 4 faces',
+    )
     color_gamma: bpy.props.FloatProperty(
         name='Gamma', default=1.0, min=0.1, max=10.0, precision=2, step=1,
         description='Color gamma on sampled face colors: 1 = as-is, >1 = darker, <1 = lighter',
@@ -3806,6 +3811,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         layout.prop(self, 'remove_original')
         layout.prop(self, 'merge_verts')
         layout.prop(self, 'fill_open_edges')
+        layout.prop(self, 'fix_checker')
         layout.prop(self, 'color_gamma')
         col = layout.column(align=True)
         col.label(text='Relief (open plane, no back wall):')
@@ -4089,6 +4095,40 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             log(f'Relief column fill: +{n_filled} cells in {time.time() - t_fill:.1f}s, '
                 f'total {int(occ.sum())}')
             yield (f'{int(occ.sum())} total cells (+{n_filled} relief)', 20)
+
+        if self.fix_checker:
+            # Diagonal cube contacts (checkerboard: two occupied cells on a diagonal, the other
+            # two empty) put 4 faces on one edge -> non-manifold. Fill one empty cell per
+            # contact. Repeat: adding a cell can create a new contact in another axis plane.
+            yield ('Fixing diagonal contacts...', 19)
+            t_checker = time.time()
+            n_checker = 0
+            for _pass in range(6):
+                added = 0
+                for ax in ((0, 1), (1, 2), (0, 2)):
+                    a0, a1 = ax
+                    sl00 = [slice(None)] * 3; sl00[a0], sl00[a1] = slice(0, -1), slice(0, -1)
+                    sl11 = [slice(None)] * 3; sl11[a0], sl11[a1] = slice(1, None), slice(1, None)
+                    sl10 = [slice(None)] * 3; sl10[a0], sl10[a1] = slice(1, None), slice(0, -1)
+                    sl01 = [slice(None)] * 3; sl01[a0], sl01[a1] = slice(0, -1), slice(1, None)
+                    A = occ[tuple(sl00)]
+                    B = occ[tuple(sl11)]
+                    Cn = occ[tuple(sl10)]
+                    Dn = occ[tuple(sl01)]
+                    # both diagonal orientations: (A,B occ, C,D empty) and (C,D occ, A,B empty)
+                    p1 = A & B & ~Cn & ~Dn
+                    p2 = Cn & Dn & ~A & ~B
+                    if p1.any():
+                        occ[tuple(sl10)][p1] = True
+                        added += int(p1.sum())
+                    if p2.any():
+                        occ[tuple(sl00)][p2] = True
+                        added += int(p2.sum())
+                n_checker += added
+                if added == 0:
+                    break
+            log(f'Diagonal contacts fixed: +{n_checker} cells in {time.time() - t_checker:.1f}s')
+            yield (f'Diagonal contacts resolved ({n_checker} cells)', 19)
 
         free = ~occ
         # Seed exterior from the grid faces (border is air thanks to bbox margin). A capped side is
@@ -5319,6 +5359,7 @@ def sna_voxel_block_remesh_interface(layout_function):
                           icon_value=string_to_icon('MOD_BUILD'))
         op.merge_verts = True
         op.fill_open_edges = True
+        op.fix_checker = True
     else:
         box.label(text='Add Edit By Colour modifier first', icon_value=0)
     box.operator('sna.test_voxel_block_remesh', text='Self-Test: Voxel Block Remesh',
