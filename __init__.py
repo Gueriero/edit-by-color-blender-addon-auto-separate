@@ -3673,6 +3673,11 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         name='Merge Cube Vertices', default=True,
         description='Weld coincident vertices between adjacent cubes into one connected mesh',
     )
+    fill_open_edges: bpy.props.BoolProperty(
+        name='Fill Open Edges', default=True,
+        description='After separate by color, close the open boundary edges of each color part '
+                    '(seals multi-color voxel shells; caps get the part’s dominant material)',
+    )
     color_gamma: bpy.props.FloatProperty(
         name='Gamma', default=1.0, min=0.1, max=10.0, precision=2, step=1,
         description='Color gamma on sampled face colors: 1 = as-is, >1 = darker, <1 = lighter',
@@ -3800,6 +3805,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         layout.prop(self, 'do_separate')
         layout.prop(self, 'remove_original')
         layout.prop(self, 'merge_verts')
+        layout.prop(self, 'fill_open_edges')
         layout.prop(self, 'color_gamma')
         col = layout.column(align=True)
         col.label(text='Relief (open plane, no back wall):')
@@ -4457,12 +4463,50 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             context.view_layer.objects.active = result_obj
             bpy.ops.object.mode_set(mode='EDIT')
             bpy.ops.mesh.select_all(action='SELECT')
+            before_sep = set(bpy.data.objects)
             try:
                 bpy.ops.mesh.separate(type='MATERIAL')
             except RuntimeError as e:
                 log(f'Separate warning: {e}')
             bpy.ops.object.mode_set(mode='OBJECT')
             log(f'Separation done in {time.time() - t_sep:.1f}s')
+
+            if self.fill_open_edges:
+                # Each color part is an open patch where its color met another: the boundary
+                # between materials, skipped by the voxel face extraction. Print toolboxes
+                # flag those edges as non-manifold. Close every boundary loop of every part;
+                # caps take the part's dominant material so the seam color stays sane.
+                yield ('Filling open edges...', 94)
+                t_fill = time.time()
+                parts = [result_obj] + [o for o in bpy.data.objects
+                                        if o not in before_sep and o.type == 'MESH']
+                total_caps = 0
+                for part in parts:
+                    bm_f = bmesh.new()
+                    bm_f.from_mesh(part.data)
+                    boundary = [e for e in bm_f.edges if e.is_boundary]
+                    if not boundary:
+                        bm_f.free()
+                        continue
+                    n0 = len(bm_f.faces)
+                    dominant = 0
+                    if n0:
+                        counts = {}
+                        for f in bm_f.faces:
+                            counts[f.material_index] = counts.get(f.material_index, 0) + 1
+                        dominant = max(counts, key=counts.get)
+                    bmesh.ops.holes_fill(bm_f, edges=boundary)
+                    bm_f.faces.ensure_lookup_table()
+                    caps = 0
+                    for f in bm_f.faces[n0:]:
+                        f.material_index = dominant
+                        caps += 1
+                    bm_f.to_mesh(part.data)
+                    bm_f.free()
+                    total_caps += caps
+                    part.data.update()
+                log(f'Open edges filled: +{total_caps} cap faces across {len(parts)} parts '
+                    f'in {time.time() - t_fill:.1f}s')
 
         if self.remove_original:
             log(f'Removing original object {obj.name}')
@@ -5274,6 +5318,7 @@ def sna_voxel_block_remesh_interface(layout_function):
         op = box.operator('sna.voxel_block_remesh', text='Voxel Remesh & Colorize',
                           icon_value=string_to_icon('MOD_BUILD'))
         op.merge_verts = True
+        op.fill_open_edges = True
     else:
         box.label(text='Add Edit By Colour modifier first', icon_value=0)
     box.operator('sna.test_voxel_block_remesh', text='Self-Test: Voxel Block Remesh',
