@@ -3683,6 +3683,12 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         description='Fill one of the two empty cells in every diagonal (checkerboard) cell contact, '
                     'so no edge is shared by 4 faces',
     )
+    use_face_materials: bpy.props.BoolProperty(
+        name='Use Face Materials (no texture)', default=False,
+        description='Take each cube color from the material of the nearest polygon instead of a '
+                    'texture. No UV map and no Base Texture needed — for meshes with materials '
+                    'assigned per face',
+    )
     color_gamma: bpy.props.FloatProperty(
         name='Gamma', default=1.0, min=0.1, max=10.0, precision=2, step=1,
         description='Color gamma on sampled face colors: 1 = as-is, >1 = darker, <1 = lighter',
@@ -3712,19 +3718,24 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         obj = context.view_layer.objects.active
         if obj is None or obj.type != 'MESH':
             self.report({'ERROR'}, 'No active mesh'); return {'CANCELLED'}
-        mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN')
-        if mod is None:
-            self.report({'ERROR'}, 'Add Edit By Colour modifier first'); return {'CANCELLED'}
-        try: uv_name = mod['Socket_2']
-        except Exception: uv_name = ''
-        try: image = mod['Socket_4']
-        except Exception: image = None
-        if not uv_name or uv_name not in obj.data.uv_layers:
-            self.report({'ERROR'}, 'UV Map not set in modifier'); return {'CANCELLED'}
-        if image is None:
-            self.report({'ERROR'}, 'Base Texture not set in modifier'); return {'CANCELLED'}
-        if image.size[0] == 0 or image.size[1] == 0:
-            self.report({'ERROR'}, 'Image has zero size'); return {'CANCELLED'}
+        if self.use_face_materials:
+            if not obj.material_slots:
+                self.report({'ERROR'}, 'Mesh has no materials'); return {'CANCELLED'}
+            uv_name, image = '', None
+        else:
+            mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN')
+            if mod is None:
+                self.report({'ERROR'}, 'Add Edit By Colour modifier first'); return {'CANCELLED'}
+            try: uv_name = mod['Socket_2']
+            except Exception: uv_name = ''
+            try: image = mod['Socket_4']
+            except Exception: image = None
+            if not uv_name or uv_name not in obj.data.uv_layers:
+                self.report({'ERROR'}, 'UV Map not set in modifier'); return {'CANCELLED'}
+            if image is None:
+                self.report({'ERROR'}, 'Base Texture not set in modifier'); return {'CANCELLED'}
+            if image.size[0] == 0 or image.size[1] == 0:
+                self.report({'ERROR'}, 'Image has zero size'); return {'CANCELLED'}
 
         self._gen = self._work(context, obj, image, uv_name)
         self._spin_idx = 0
@@ -3806,6 +3817,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         layout = self.layout
         layout.prop(self, 'cell_size_mm')
         layout.prop(self, 'num_colors')
+        layout.prop(self, 'use_face_materials')
         layout.prop(self, 'use_hsv')
         layout.prop(self, 'do_separate')
         layout.prop(self, 'remove_original')
@@ -3839,13 +3851,32 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         # Face directions: +X, -X, +Y, -Y, +Z, -Z (constant across all phases)
         DIRS = [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]
 
-        # Phase 1: Read image
-        w_img, h_img = image.size[0], image.size[1]
-        yield (f'Reading image {w_img}x{h_img}...', 0)
-        npx = np.empty(len(image.pixels), dtype=np.float32)
-        image.pixels.foreach_get(npx)
-        img = npx.reshape(h_img, w_img, 4)[:, :, :3]
-        log(f'Image read in {time.time() - t_start:.1f}s')
+        # Phase 1: Read image — or pre-read one color per material slot (no-texture mode)
+        mat_colors = None
+        if self.use_face_materials:
+            w_img = h_img = 0
+            img = None
+            yield ('Face-material mode: reading material colors...', 0)
+            mat_colors = np.zeros((max(1, len(obj.material_slots)), 3), dtype=np.float32)
+            for si, slot in enumerate(obj.material_slots):
+                col = (0.8, 0.8, 0.8)
+                mat = slot.material
+                if mat is not None:
+                    col = tuple(mat.diffuse_color[:3])
+                    if mat.use_nodes and mat.node_tree:
+                        for nd in mat.node_tree.nodes:
+                            if nd.type == 'BSDF_PRINCIPLED':
+                                col = tuple(nd.inputs['Base Color'].default_value[:3])
+                                break
+                mat_colors[si] = col
+            log(f'Face-material mode: {len(obj.material_slots)} slots read, no texture/UV needed')
+        else:
+            w_img, h_img = image.size[0], image.size[1]
+            yield (f'Reading image {w_img}x{h_img}...', 0)
+            npx = np.empty(len(image.pixels), dtype=np.float32)
+            image.pixels.foreach_get(npx)
+            img = npx.reshape(h_img, w_img, 4)[:, :, :3]
+            log(f'Image read in {time.time() - t_start:.1f}s')
 
         # Phase 2: Build BVHTree from world-space mesh
         yield ('Building BVHTree...', 2)
@@ -4215,7 +4246,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         # Phase 5: Color sampling per face via BVHTree -> UV -> texture
         yield ('Sampling texture color per face...', 27)
         t_color = time.time()
-        uv_layer = mesh.uv_layers[uv_name].data
+        uv_layer = None if self.use_face_materials else mesh.uv_layers[uv_name].data
         face_colors = np.zeros((len(faces_to_emit), 3), dtype=np.float32)
         M_inv = np.array(obj.matrix_world.inverted(), dtype=np.float32)
 
@@ -4235,6 +4266,15 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
 
             # Get original polygon index + sub-triangle
             poly_idx, sub_ti = bvh_face_to_poly[bvh_face_idx]
+            if self.use_face_materials:
+                # no UV/texture: cube takes the material color of the polygon it sits on
+                mi = int(mesh.polygons[poly_idx].material_index)
+                if 0 <= mi < len(mat_colors):
+                    face_colors[fi] = mat_colors[mi]
+                if fi % 10000 == 0 and fi > 0:
+                    pct = 22 + int(18 * fi / len(faces_to_emit))
+                    yield (f'Sampling colors {fi}/{len(faces_to_emit)}...', pct)
+                continue
             poly = mesh.polygons[poly_idx]
             li = poly.loop_indices
             ln = poly.loop_total
@@ -4425,7 +4465,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
 
         # Create new mesh object for the result; name carries the settings so the outliner
         # shows at a glance which run produced which mesh: <mode>_<cell>mm_K<colors>_<src>_Voxel
-        mode = 'HSV' if self.use_hsv else 'sRGB'
+        mode = 'MAT' if self.use_face_materials else ('HSV' if self.use_hsv else 'sRGB')
         res_name = f'{mode}_{self.cell_size_mm:g}mm_K{len(cluster_mats)}_g{self.color_gamma:g}_{obj.name}_Voxel'
         result_mesh = bpy.data.meshes.new(res_name)
         result_obj = bpy.data.objects.new(res_name, result_mesh)
@@ -5349,19 +5389,18 @@ def sna_voxel_block_remesh_interface(layout_function):
     box.label(text='Voxel Block Remesh (3D Print)', icon_value=string_to_icon('MESH_CUBE'))
     obj = bpy.context.view_layer.objects.active
     mod = obj.modifiers.get('KIRI_Edit_By_Colour_GN') if obj else None
-    if mod is not None:
-        col = box.column(align=True)
-        col.prop(bpy.context.scene, 'sna_voxel_cap_side')
-        col.prop(bpy.context.scene, 'sna_voxel_wall_cells')
-        col.prop(bpy.context.scene, 'sna_voxel_relief_thickness_mm')
-        col.prop(bpy.context.scene, 'sna_voxel_relief_back')
-        op = box.operator('sna.voxel_block_remesh', text='Voxel Remesh & Colorize',
-                          icon_value=string_to_icon('MOD_BUILD'))
-        op.merge_verts = True
-        op.fill_open_edges = True
-        op.fix_checker = True
-    else:
-        box.label(text='Add Edit By Colour modifier first', icon_value=0)
+    col = box.column(align=True)
+    col.prop(bpy.context.scene, 'sna_voxel_cap_side')
+    col.prop(bpy.context.scene, 'sna_voxel_wall_cells')
+    col.prop(bpy.context.scene, 'sna_voxel_relief_thickness_mm')
+    col.prop(bpy.context.scene, 'sna_voxel_relief_back')
+    op = box.operator('sna.voxel_block_remesh', text='Voxel Remesh & Colorize',
+                      icon_value=string_to_icon('MOD_BUILD'))
+    op.merge_verts = True
+    op.fill_open_edges = True
+    op.fix_checker = True
+    if mod is None:
+        box.label(text='No Edit By Colour modifier — turn on Face Materials', icon_value=0)
     box.operator('sna.test_voxel_block_remesh', text='Self-Test: Voxel Block Remesh',
                  icon_value=string_to_icon('EXPERIMENTAL'))
 
