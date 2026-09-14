@@ -3694,6 +3694,11 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         description='Convert sampled colors to luminance before clustering. With Gamma this gives '
                     'a monochrome relief that is uniformly lighter (>1 darkens, <1 lightens)',
     )
+    highlight_lift: bpy.props.FloatProperty(
+        name='Highlight Lift', default=0.0, min=0.0, max=2.0, precision=2, step=10,
+        description='Lighten the whites only: out = in + K·in³. Darks (in≈0) stay untouched, '
+                    '0 = off',
+    )
     color_gamma: bpy.props.FloatProperty(
         name='Gamma', default=1.0, min=0.1, max=10.0, precision=2, step=1,
         description='Color gamma on sampled face colors: 1 = as-is, >1 = darker, <1 = lighter',
@@ -3824,6 +3829,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         layout.prop(self, 'num_colors')
         layout.prop(self, 'use_face_materials')
         layout.prop(self, 'grayscale')
+        layout.prop(self, 'highlight_lift')
         layout.prop(self, 'use_hsv')
         layout.prop(self, 'do_separate')
         layout.prop(self, 'remove_original')
@@ -4349,6 +4355,10 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         if self.color_gamma != 1.0:
             face_colors = np.clip(face_colors, 0.0, 1.0) ** self.color_gamma
             log(f'Gamma {self.color_gamma:.2f} applied to face colors (mean={float(face_colors.mean()):.4f})')
+        if self.highlight_lift > 0.0:
+            # whites only: cubic weight leaves darks (in≈0) untouched
+            face_colors = np.clip(face_colors + self.highlight_lift * face_colors ** 3, 0.0, 1.0)
+            log(f'Highlight lift {self.highlight_lift:.2f} applied (mean={float(face_colors.mean()):.4f})')
         yield (f'Colors sampled ({len(faces_to_emit)} faces)', 40)
 
         # Phase 6: K-means palette
@@ -4477,7 +4487,9 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         # shows at a glance which run produced which mesh: <mode>_<cell>mm_K<colors>_<src>_Voxel
         mode = 'MAT' if self.use_face_materials else ('HSV' if self.use_hsv else 'sRGB')
         res_name = (f'{mode}_{self.cell_size_mm:g}mm_K{len(cluster_mats)}_g{self.color_gamma:g}'
-                    f'{"_gray" if self.grayscale else ""}_{obj.name}_Voxel')
+                    f'{"_gray" if self.grayscale else ""}'
+                    f'{"_hl" + format(self.highlight_lift, "g") if self.highlight_lift > 0 else ""}'
+                    f'_{obj.name}_Voxel')
         result_mesh = bpy.data.meshes.new(res_name)
         result_obj = bpy.data.objects.new(res_name, result_mesh)
         context.collection.objects.link(result_obj)
