@@ -3689,6 +3689,11 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                     'texture. No UV map and no Base Texture needed — for meshes with materials '
                     'assigned per face',
     )
+    grayscale: bpy.props.BoolProperty(
+        name='Grayscale', default=False,
+        description='Convert sampled colors to luminance before clustering. With Gamma this gives '
+                    'a monochrome relief that is uniformly lighter (>1 darkens, <1 lightens)',
+    )
     color_gamma: bpy.props.FloatProperty(
         name='Gamma', default=1.0, min=0.1, max=10.0, precision=2, step=1,
         description='Color gamma on sampled face colors: 1 = as-is, >1 = darker, <1 = lighter',
@@ -3818,6 +3823,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         layout.prop(self, 'cell_size_mm')
         layout.prop(self, 'num_colors')
         layout.prop(self, 'use_face_materials')
+        layout.prop(self, 'grayscale')
         layout.prop(self, 'use_hsv')
         layout.prop(self, 'do_separate')
         layout.prop(self, 'remove_original')
@@ -4336,6 +4342,10 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                 yield (f'Sampling colors {fi}/{len(faces_to_emit)}...', pct)
 
         log(f'Color sampling done in {time.time() - t_color:.1f}s')
+        if self.grayscale:
+            lum = face_colors @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+            face_colors = np.repeat(lum[:, None], 3, axis=1)
+            log(f'Grayscale applied (mean={float(lum.mean()):.4f})')
         if self.color_gamma != 1.0:
             face_colors = np.clip(face_colors, 0.0, 1.0) ** self.color_gamma
             log(f'Gamma {self.color_gamma:.2f} applied to face colors (mean={float(face_colors.mean()):.4f})')
@@ -4466,7 +4476,8 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         # Create new mesh object for the result; name carries the settings so the outliner
         # shows at a glance which run produced which mesh: <mode>_<cell>mm_K<colors>_<src>_Voxel
         mode = 'MAT' if self.use_face_materials else ('HSV' if self.use_hsv else 'sRGB')
-        res_name = f'{mode}_{self.cell_size_mm:g}mm_K{len(cluster_mats)}_g{self.color_gamma:g}_{obj.name}_Voxel'
+        res_name = (f'{mode}_{self.cell_size_mm:g}mm_K{len(cluster_mats)}_g{self.color_gamma:g}'
+                    f'{"_gray" if self.grayscale else ""}_{obj.name}_Voxel')
         result_mesh = bpy.data.meshes.new(res_name)
         result_obj = bpy.data.objects.new(res_name, result_mesh)
         context.collection.objects.link(result_obj)
