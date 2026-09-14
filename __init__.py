@@ -3691,17 +3691,26 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
     )
     grayscale: bpy.props.BoolProperty(
         name='Grayscale', default=False,
-        description='Convert sampled colors to luminance before clustering. With Gamma this gives '
-                    'a monochrome relief that is uniformly lighter (>1 darkens, <1 lightens)',
+        description='Turn any colour texture or material set into a monochrome relief.\n'
+                    'Then shape the tone: Gamma = whole image, Highlight Lift / Shadow Drop = ends',
     )
     highlight_lift: bpy.props.FloatProperty(
         name='Highlight Lift', default=0.0, min=0.0, max=2.0, precision=2, step=10,
-        description='Lighten the whites only: out = in + K·in³. Darks (in≈0) stay untouched, '
-                    '0 = off',
+        description='Lighten the WHITES only: out = in + K·in³ — darks (in≈0) stay as they are.\n'
+                    'Start 0.3–0.8 for a subtle glow, 1.5+ for a flat white-out. 0 = off.\n'
+                    'Applied after Gamma; pairs with Shadow Drop for more contrast',
+    )
+    shadow_drop: bpy.props.FloatProperty(
+        name='Shadow Drop', default=0.0, min=0.0, max=2.0, precision=2, step=10,
+        description='Darken the SHADOWS only: out = in − K·(1−in)³ — lights (in≈1) stay as they are.\n'
+                    'Start 0.3–0.8 for deeper darks, 1.5+ for solid black. 0 = off.\n'
+                    'Applied after Highlight Lift; use both for a high-contrast two-tone relief',
     )
     color_gamma: bpy.props.FloatProperty(
         name='Gamma', default=1.0, min=0.1, max=10.0, precision=2, step=1,
-        description='Color gamma on sampled face colors: 1 = as-is, >1 = darker, <1 = lighter',
+        description='Overall tone of every cube colour: 1 = unchanged, 1.5–3 = darker, '
+                    '0.5–0.8 = lighter.\nStart here if the whole voxel mesh comes out too light '
+                    'or too dark.\nApplied after Grayscale, before Highlight Lift / Shadow Drop',
     )
 
     _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
@@ -3829,7 +3838,9 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         layout.prop(self, 'num_colors')
         layout.prop(self, 'use_face_materials')
         layout.prop(self, 'grayscale')
+        layout.label(text='Tone: Grayscale → Gamma → Lift / Drop (hover for tips)')
         layout.prop(self, 'highlight_lift')
+        layout.prop(self, 'shadow_drop')
         layout.prop(self, 'use_hsv')
         layout.prop(self, 'do_separate')
         layout.prop(self, 'remove_original')
@@ -4359,6 +4370,10 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             # whites only: cubic weight leaves darks (in≈0) untouched
             face_colors = np.clip(face_colors + self.highlight_lift * face_colors ** 3, 0.0, 1.0)
             log(f'Highlight lift {self.highlight_lift:.2f} applied (mean={float(face_colors.mean()):.4f})')
+        if self.shadow_drop > 0.0:
+            # shadows only: mirrored cubic weight leaves lights (in≈1) untouched
+            face_colors = np.clip(face_colors - self.shadow_drop * (1.0 - face_colors) ** 3, 0.0, 1.0)
+            log(f'Shadow drop {self.shadow_drop:.2f} applied (mean={float(face_colors.mean()):.4f})')
         yield (f'Colors sampled ({len(faces_to_emit)} faces)', 40)
 
         # Phase 6: K-means palette
@@ -4489,6 +4504,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         res_name = (f'{mode}_{self.cell_size_mm:g}mm_K{len(cluster_mats)}_g{self.color_gamma:g}'
                     f'{"_gray" if self.grayscale else ""}'
                     f'{"_hl" + format(self.highlight_lift, "g") if self.highlight_lift > 0 else ""}'
+                    f'{"_sd" + format(self.shadow_drop, "g") if self.shadow_drop > 0 else ""}'
                     f'_{obj.name}_Voxel')
         result_mesh = bpy.data.meshes.new(res_name)
         result_obj = bpy.data.objects.new(res_name, result_mesh)
