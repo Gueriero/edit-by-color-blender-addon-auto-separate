@@ -3920,25 +3920,25 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         # Build BVHTree (needs Python list of coords + list of index-triplets)
         import mathutils
         verts_list = verts_world.tolist()
-        polys_list = []
-        poly_loop_start = np.empty(n_polys, dtype=np.int32)
-        poly_loop_total = np.empty(n_polys, dtype=np.int32)
-        mesh.polygons.foreach_get('loop_start', poly_loop_start)
-        mesh.polygons.foreach_get('loop_total', poly_loop_total)
         loop_verts = np.empty(len(mesh.loops), dtype=np.int32)
         mesh.loops.foreach_get('vertex_index', loop_verts)
 
-        # Build mapping: BVH face index -> (original polygon index, sub-triangle index)
-        bvh_face_to_poly = []
-        for pi in range(n_polys):
-            s = int(poly_loop_start[pi]); t = int(poly_loop_total[pi])
-            vs = loop_verts[s:s + t].tolist()
-            # Triangulate n-gon for BVH
-            for ti in range(1, t - 1):
-                polys_list.append((vs[0], vs[ti], vs[ti + 1]))
-                bvh_face_to_poly.append((pi, ti))
+        # Triangulate with Blender's own loop triangles. Never fan an n-gon from loop 0:
+        # a concave polygon (a Meshy relief's flat back plate is ONE 6500-loop n-gon) fans
+        # into triangles that lie outside it — 4.5x its real area here — and every phantom
+        # triangle voxelizes empty space, which showed up as flat "wings" between the arms.
+        mesh.calc_loop_triangles()
+        n_tris = len(mesh.loop_triangles)
+        tri_verts = np.empty(n_tris * 3, dtype=np.int32)
+        tri_loops = np.empty(n_tris * 3, dtype=np.int32)
+        tri_poly = np.empty(n_tris, dtype=np.int32)
+        mesh.loop_triangles.foreach_get('vertices', tri_verts)
+        mesh.loop_triangles.foreach_get('loops', tri_loops)
+        mesh.loop_triangles.foreach_get('polygon_index', tri_poly)
+        polys_list = tri_verts.reshape(-1, 3).tolist()
 
-        bvh = mathutils.bvhtree.BVHTree.FromPolygons(verts_list, polys_list)
+        bvh = mathutils.bvhtree.BVHTree.FromPolygons(verts_list, polys_list,
+                                                     all_triangles=True)
         log(f'BVHTree built ({len(polys_list)} tris) in {time.time() - t_bvh:.1f}s')
 
         # Phase 3: Voxel occupancy via surface sampling (fast)
@@ -4017,59 +4017,60 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         # plane — not just under its 2D shadow.
         rast_total = 0
         proj_table = [(1, 2), (2, 0), (0, 1)]  # ax0, ax1 for drop = 0, 1, 2
-        for poly in obj.data.polygons:
-            pv = [verts_world[vi] for vi in poly.vertices]
-            for ti in range(1, len(pv) - 1):
-                a, b_vec, c_vec = pv[0], pv[ti], pv[ti + 1]
-                ia = np.array([(a[k] - bbox_min[k]) / cell_size for k in range(3)], dtype=np.float32)
-                ib = np.array([(b_vec[k] - bbox_min[k]) / cell_size for k in range(3)], dtype=np.float32)
-                ic = np.array([(c_vec[k] - bbox_min[k]) / cell_size for k in range(3)], dtype=np.float32)
+        tri_v = tri_verts.reshape(-1, 3)
+        for ti in range(n_tris):
+            a = verts_world[tri_v[ti, 0]]
+            b_vec = verts_world[tri_v[ti, 1]]
+            c_vec = verts_world[tri_v[ti, 2]]
+            ia = np.array([(a[k] - bbox_min[k]) / cell_size for k in range(3)], dtype=np.float32)
+            ib = np.array([(b_vec[k] - bbox_min[k]) / cell_size for k in range(3)], dtype=np.float32)
+            ic = np.array([(c_vec[k] - bbox_min[k]) / cell_size for k in range(3)], dtype=np.float32)
 
-                normal = np.cross(ib - ia, ic - ia)
-                drop = int(np.argmax(np.abs(normal)))
-                ax0, ax1 = proj_table[drop]
+            normal = np.cross(ib - ia, ic - ia)
+            drop = int(np.argmax(np.abs(normal)))
+            ax0, ax1 = proj_table[drop]
 
-                mn = np.maximum(0, np.floor(np.minimum(np.minimum(ia, ib), ic)).astype(np.int32) - 1)
-                mx = np.minimum([grid_size_x - 1, grid_size_y - 1, grid_size_z - 1],
-                                np.ceil(np.maximum(np.maximum(ia, ib), ic)).astype(np.int32) + 1)
-                if mx[0] < mn[0] or mx[1] < mn[1] or mx[2] < mn[2]:
-                    continue
+            mn = np.maximum(0, np.floor(np.minimum(np.minimum(ia, ib), ic)).astype(np.int32) - 1)
+            mx = np.minimum([grid_size_x - 1, grid_size_y - 1, grid_size_z - 1],
+                            np.ceil(np.maximum(np.maximum(ia, ib), ic)).astype(np.int32) + 1)
+            if mx[0] < mn[0] or mx[1] < mn[1] or mx[2] < mn[2]:
+                continue
 
-                # 2×2 determinant in the projection plane
-                d = ((ib[ax1] - ic[ax1]) * (ia[ax0] - ic[ax0])
-                     + (ic[ax0] - ib[ax0]) * (ia[ax1] - ic[ax1]))
-                if abs(d) < 1e-12:
-                    continue
+            # 2×2 determinant in the projection plane
+            d = ((ib[ax1] - ic[ax1]) * (ia[ax0] - ic[ax0])
+                 + (ic[ax0] - ib[ax0]) * (ia[ax1] - ic[ax1]))
+            if abs(d) < 1e-12:
+                continue
 
-                inner, mid, outer = ax0, ax1, drop
-                step0 = (ib[ax1] - ic[ax1]) / d
-                step1 = (ic[ax1] - ia[ax1]) / d
-                # precomputed drop-coordinate for the third vertex (w = 1 - w0 - w1)
-                drA, drB, drC = float(ia[drop]), float(ib[drop]), float(ic[drop])
+            inner, mid, outer = ax0, ax1, drop
+            step0 = (ib[ax1] - ic[ax1]) / d
+            step1 = (ic[ax1] - ia[ax1]) / d
+            # precomputed drop-coordinate for the third vertex (w = 1 - w0 - w1)
+            drA, drB, drC = float(ia[drop]), float(ib[drop]), float(ic[drop])
 
-                ic_mid, ic_inner = ic[mid], ic[inner]
+            ic_mid, ic_inner = ic[mid], ic[inner]
 
-                for i_outer in range(int(mn[outer]), int(mx[outer]) + 1):
-                    co = float(i_outer) + 0.5
-                    for i_mid in range(int(mn[mid]), int(mx[mid]) + 1):
-                        cm = float(i_mid) + 0.5
-                        ci0 = mn[inner] + 0.5 - ic_inner
-                        dy = cm - ic_mid
-                        w0 = ((ib[ax1] - ic[ax1]) * ci0 + (ic[ax0] - ib[ax0]) * dy) / d
-                        w1 = ((ic[ax1] - ia[ax1]) * ci0 + (ia[ax0] - ic[ax0]) * dy) / d
-                        for i_inner in range(int(mn[inner]), int(mx[inner]) + 1):
-                            if w0 >= -1e-6 and w1 >= -1e-6 and (w0 + w1) <= 1.0 + 1e-6:
-                                # 3D barycentric interpolation of dropped axis
-                                w2 = 1.0 - w0 - w1
-                                plane_drop = drA * w0 + drB * w1 + drC * w2
-                                if abs(co - plane_drop) <= 0.5001:
-                                    ix = i_inner if inner == 0 else (i_outer if outer == 0 else i_mid)
-                                    iy = i_inner if inner == 1 else (i_outer if outer == 1 else i_mid)
-                                    iz = i_inner if inner == 2 else (i_outer if outer == 2 else i_mid)
-                                    _add(ix, iy, iz)
-                                    rast_total += 1
-                            w0 += step0
-                            w1 += step1
+            for i_outer in range(int(mn[outer]), int(mx[outer]) + 1):
+                co = float(i_outer) + 0.5
+                for i_mid in range(int(mn[mid]), int(mx[mid]) + 1):
+                    cm = float(i_mid) + 0.5
+                    ci0 = mn[inner] + 0.5 - ic_inner
+                    dy = cm - ic_mid
+                    w0 = ((ib[ax1] - ic[ax1]) * ci0 + (ic[ax0] - ib[ax0]) * dy) / d
+                    w1 = ((ic[ax1] - ia[ax1]) * ci0 + (ia[ax0] - ic[ax0]) * dy) / d
+                    for i_inner in range(int(mn[inner]), int(mx[inner]) + 1):
+                        if w0 >= -1e-6 and w1 >= -1e-6 and (w0 + w1) <= 1.0 + 1e-6:
+                            # 3D barycentric interpolation of dropped axis
+                            w2 = 1.0 - w0 - w1
+                            plane_drop = drA * w0 + drB * w1 + drC * w2
+                            if abs(co - plane_drop) <= 0.5001:
+                                ix = i_inner if inner == 0 else (i_outer if outer == 0 else i_mid)
+                                iy = i_inner if inner == 1 else (i_outer if outer == 1 else i_mid)
+                                iz = i_inner if inner == 2 else (i_outer if outer == 2 else i_mid)
+                                _add(ix, iy, iz)
+                                rast_total += 1
+                        w0 += step0
+                        w1 += step1
             if len(occupied) % 50000 == 0:
                 yield (f'Rasterizing faces ({len(occupied)} cells)...', 10)
         log(f'Face rasterization: +{rast_total} cells')
@@ -4287,8 +4288,8 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                 continue
             hit_loc, hit_norm, bvh_face_idx, dist = nearest
 
-            # Get original polygon index + sub-triangle
-            poly_idx, sub_ti = bvh_face_to_poly[bvh_face_idx]
+            # Get original polygon index + its 3 loop indices for this BVH triangle
+            poly_idx = int(tri_poly[bvh_face_idx])
             if self.use_face_materials:
                 # no UV/texture: cube takes the material color of the polygon it sits on
                 mi = int(mesh.polygons[poly_idx].material_index)
@@ -4298,25 +4299,21 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                     pct = 22 + int(18 * fi / len(faces_to_emit))
                     yield (f'Sampling colors {fi}/{len(faces_to_emit)}...', pct)
                 continue
-            poly = mesh.polygons[poly_idx]
-            li = poly.loop_indices
-            ln = poly.loop_total
-
-            if ln < 3:
-                continue
+            l0 = int(tri_loops[bvh_face_idx * 3])
+            l1 = int(tri_loops[bvh_face_idx * 3 + 1])
+            l2 = int(tri_loops[bvh_face_idx * 3 + 2])
 
             # Barycentric interpolation of UV at hit_location
-            # Use the correct sub-triangle from BVH triangulation
-            uv0 = uv_layer[li[0]].uv
-            uv1 = uv_layer[li[sub_ti]].uv
-            uv2 = uv_layer[li[sub_ti + 1]].uv
+            uv0 = uv_layer[l0].uv
+            uv1 = uv_layer[l1].uv
+            uv2 = uv_layer[l2].uv
 
             # Transform hit to local space for barycentric computation
             hit_local_pt = M_inv[:3, :3] @ np.array(hit_loc, dtype=np.float32) + M_inv[:3, 3]
 
-            v0_local = verts_local[poly.vertices[0]]
-            v1_local = verts_local[poly.vertices[sub_ti]]
-            v2_local = verts_local[poly.vertices[sub_ti + 1]]
+            v0_local = verts_local[loop_verts[l0]]
+            v1_local = verts_local[loop_verts[l1]]
+            v2_local = verts_local[loop_verts[l2]]
 
             # Barycentric weights in 3D space
             e0 = v1_local - v0_local
