@@ -2721,6 +2721,24 @@ def _sna_rgb_to_hsv_np(arr):
     return np.stack([h_, s, mx], axis=1)
 
 
+_SNA_COLLAPSE_CHROMA = 0.03   # palette colors this close in hue x saturation are shades of one color
+
+
+def _sna_hsv_centers_to_rgb(centers, chroma_gain=1.0):
+    """centers: (K,3) k-means centroids in the circular-hue encoding
+    (cos(H)*chroma*gain, sin(H)*chroma*gain, V) → (K,3) RGB."""
+    import colorsys
+    import numpy as np
+    h = (np.arctan2(centers[:, 1], centers[:, 0]) / (2.0 * np.pi)) % 1.0
+    v = np.clip(centers[:, 2], 0.0, 1.0)
+    chroma = np.sqrt(centers[:, 0] ** 2 + centers[:, 1] ** 2) / max(float(chroma_gain), 1e-9)
+    s = np.clip(chroma / np.maximum(v, 1e-6), 0.0, 1.0)
+    out = np.zeros((centers.shape[0], 3), dtype=np.float32)
+    for c in range(centers.shape[0]):
+        out[c] = colorsys.hsv_to_rgb(float(h[c]), float(s[c]), float(v[c]))
+    return out
+
+
 def _sna_kmeanspp_pick(rng, dist_sq):
     """k-means++ weighted pick via inverse-CDF.
 
@@ -3635,6 +3653,62 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         col.prop(self, 'kmeans_subsample')
 
 
+# Dialog settings of the voxel operator, remembered for the rest of the session. A props dialog
+# rebuilds its properties from the class defaults on every invoke, so anything typed is lost the
+# moment the user cancels to go fix the modifier. The window manager is not written into .blend
+# files (verified: props set there are gone after a restart), which gives exactly the wanted
+# lifetime — survive cancel-and-reopen, come back as defaults after Blender exits.
+_SNA_VOXEL_PERSIST = (
+    'cell_size_mm', 'num_colors', 'kmeans_iters', 'kmeans_subsample', 'use_hsv', 'do_separate',
+    'remove_original', 'merge_verts', 'fill_open_edges', 'fix_checker', 'collapse_similar',
+    'collapse_dist', 'use_face_materials', 'grayscale', 'saturation', 'highlight_lift',
+    'shadow_drop', 'color_gamma',
+)
+_SNA_VOXEL_STASH_KEY = 'sna_voxel_last_settings'
+
+
+def _sna_voxel_stash_settings(op, context=None):
+    """Property update callback: mirror every edited value onto the window manager.
+
+    Only while the props dialog is open: the N-panel's button sets merge_verts / fill_open_edges
+    / fix_checker on the operator template on every redraw, and letting those writes stash would
+    overwrite the user's dialog values with template state.
+    """
+    if not getattr(op, '_dialog_open', False):
+        return
+    try:
+        wm = (context if context is not None else bpy.context).window_manager
+    except Exception:
+        return
+    store = {}
+    for name in _SNA_VOXEL_PERSIST:
+        try:
+            store[name] = getattr(op, name)
+        except Exception:
+            pass
+    try:
+        wm[_SNA_VOXEL_STASH_KEY] = store
+    except Exception:
+        pass
+
+
+def _sna_voxel_restore_settings(op, context=None):
+    """Put the remembered values back into a fresh operator instance before the dialog opens."""
+    try:
+        wm = (context if context is not None else bpy.context).window_manager
+        store = wm.get(_SNA_VOXEL_STASH_KEY)
+    except Exception:
+        return
+    if not store:
+        return
+    for name in _SNA_VOXEL_PERSIST:
+        if name in store:
+            try:
+                setattr(op, name, store[name])
+            except Exception:
+                pass
+
+
 class SNA_OT_voxel_block_remesh(bpy.types.Operator):
     bl_idname = 'sna.voxel_block_remesh'
     bl_label = 'Voxel Block Remesh'
@@ -3642,71 +3716,109 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     cell_size_mm: bpy.props.FloatProperty(
+        update=_sna_voxel_stash_settings,
         name='Block Size (mm)', default=5.0, min=0.5, max=100.0,
         description='Size of each block/cube in millimeters. Smaller = finer blocks, more geometry',
         precision=1, step=10,
     )
     num_colors: bpy.props.IntProperty(
+        update=_sna_voxel_stash_settings,
         name='Total Colors', default=16, min=2, max=256,
         description='Number of palette colors (K for k-means). Each color becomes one material',
     )
     kmeans_iters: bpy.props.IntProperty(
+        update=_sna_voxel_stash_settings,
         name='K-means Iterations', default=20, min=2, max=100,
     )
     kmeans_subsample: bpy.props.IntProperty(
+        update=_sna_voxel_stash_settings,
         name='K-means Sample Cap', default=20000, min=500, max=200000,
         description='Cap face-color samples for k-means clustering to keep it fast',
     )
     use_hsv: bpy.props.BoolProperty(
+        update=_sna_voxel_stash_settings,
         name='Cluster in HSV', default=True,
         description='K-means in HSV space (better perceptual grouping). Off = RGB',
     )
     do_separate: bpy.props.BoolProperty(
+        update=_sna_voxel_stash_settings,
         name='Separate by Color', default=True,
         description='Separate the result into one mesh object per material/color',
     )
     remove_original: bpy.props.BoolProperty(
+        update=_sna_voxel_stash_settings,
         name='Remove Original', default=False,
         description='Remove the source mesh object after the remesh is built',
     )
     merge_verts: bpy.props.BoolProperty(
+        update=_sna_voxel_stash_settings,
         name='Merge Cube Vertices', default=True,
         description='Weld coincident vertices between adjacent cubes into one connected mesh',
     )
     fill_open_edges: bpy.props.BoolProperty(
+        update=_sna_voxel_stash_settings,
         name='Fill Open Edges', default=True,
         description='After separate by color, close the open boundary edges of each color part '
                     '(seals multi-color voxel shells; caps get the part’s dominant material)',
     )
     fix_checker: bpy.props.BoolProperty(
+        update=_sna_voxel_stash_settings,
         name='Fix Diagonal Contacts', default=True,
         description='Fill one of the two empty cells in every diagonal (checkerboard) cell contact, '
                     'so no edge is shared by 4 faces',
     )
+    collapse_similar: bpy.props.BoolProperty(
+        update=_sna_voxel_stash_settings,
+        name='Collapse Similar Colors', default=False,
+        description='Merge palette colors that print as the same color into one, so Total Colors '
+                    'is an upper bound and fewer filaments are needed. A light relief otherwise '
+                    'gets several near-identical whites and wastes slots on shades a printer '
+                    'cannot tell apart',
+    )
+    collapse_dist: bpy.props.FloatProperty(
+        update=_sna_voxel_stash_settings,
+        name='Collapse Brightness Ratio', default=1.5, min=1.05, max=5.0, precision=2, step=1,
+        description='Brightness RATIO within which two palette colors of the same hue collapse '
+                    'into one. 1.5 merges near-whites (0.67/0.81/0.93) but keeps black vs dark '
+                    'grey apart (ratio 7). Lower it to 1.2 to keep more shading. Different hues '
+                    'never collapse — a dark purple accent stays apart from black',
+    )
     use_face_materials: bpy.props.BoolProperty(
+        update=_sna_voxel_stash_settings,
         name='Use Face Materials (no texture)', default=False,
         description='Take each cube color from the material of the nearest polygon instead of a '
                     'texture. No UV map and no Base Texture needed — for meshes with materials '
                     'assigned per face',
     )
     grayscale: bpy.props.BoolProperty(
+        update=_sna_voxel_stash_settings,
         name='Grayscale', default=False,
         description='Turn any colour texture or material set into a monochrome relief.\n'
                     'Then shape the tone: Gamma = whole image, Highlight Lift / Shadow Drop = ends',
     )
+    saturation: bpy.props.FloatProperty(
+        update=_sna_voxel_stash_settings,
+        name='Saturation', default=1.0, min=0.0, max=3.0, precision=2, step=10,
+        description='Colour intensity of the finished palette: 1 = as sampled, 1.5-2 = punchier '
+                    'filament colours, 0.5 = washed out, 0 = grey. Applied to the palette colors '
+                    'only, so it cannot disturb which colors k-means found',
+    )
     highlight_lift: bpy.props.FloatProperty(
+        update=_sna_voxel_stash_settings,
         name='Highlight Lift', default=0.0, min=0.0, max=2.0, precision=2, step=10,
         description='Lighten the WHITES only: out = in + K·in³ — darks (in≈0) stay as they are.\n'
                     'Start 0.3–0.8 for a subtle glow, 1.5+ for a flat white-out. 0 = off.\n'
                     'Applied after Gamma; pairs with Shadow Drop for more contrast',
     )
     shadow_drop: bpy.props.FloatProperty(
+        update=_sna_voxel_stash_settings,
         name='Shadow Drop', default=0.0, min=0.0, max=2.0, precision=2, step=10,
         description='Darken the SHADOWS only: out = in − K·(1−in)³ — lights (in≈1) stay as they are.\n'
                     'Start 0.3–0.8 for deeper darks, 1.5+ for solid black. 0 = off.\n'
                     'Applied after Highlight Lift; use both for a high-contrast two-tone relief',
     )
     color_gamma: bpy.props.FloatProperty(
+        update=_sna_voxel_stash_settings,
         name='Gamma', default=1.0, min=0.1, max=10.0, precision=2, step=1,
         description='Overall tone of every cube colour: 1 = unchanged, 1.5–3 = darker, '
                     '0.5–0.8 = lighter.\nStart here if the whole voxel mesh comes out too light '
@@ -3716,6 +3828,8 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
     _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
     def invoke(self, context, event):
+        self._dialog_open = True
+        _sna_voxel_restore_settings(self, context)
         return context.window_manager.invoke_props_dialog(self, width=420)
 
     def draw(self, context):
@@ -3838,6 +3952,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         layout.prop(self, 'num_colors')
         layout.prop(self, 'use_face_materials')
         layout.prop(self, 'grayscale')
+        layout.prop(self, 'saturation')
         layout.label(text='Tone: Grayscale → Gamma → Lift / Drop (hover for tips)')
         layout.prop(self, 'highlight_lift')
         layout.prop(self, 'shadow_drop')
@@ -3847,6 +3962,9 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         layout.prop(self, 'merge_verts')
         layout.prop(self, 'fill_open_edges')
         layout.prop(self, 'fix_checker')
+        layout.prop(self, 'collapse_similar')
+        if self.collapse_similar:
+            layout.prop(self, 'collapse_dist')
         layout.prop(self, 'color_gamma')
         col = layout.column(align=True)
         col.label(text='Relief (open plane, no back wall):')
@@ -4381,17 +4499,26 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         t_km = time.time()
         if self.use_hsv:
             cluster_data = _sna_rgb_to_hsv_np(face_colors)
-            # Circular hue encoding
-            hx = np.cos(cluster_data[:, 0] * 2.0 * math.pi) * cluster_data[:, 1]
-            hy = np.sin(cluster_data[:, 0] * 2.0 * math.pi) * cluster_data[:, 1]
+            # Circular hue encoding, weighted by CHROMA (S*V == max-min), not by S alone.
+            # Near black the hue is noise: a (0.02, 0.01, 0.015) pixel reports S=0.5 and an
+            # arbitrary angle, so S-weighting flung dark fabric all over the hue circle and
+            # the black shirt came out speckled with whatever cluster caught each cube.
+            # Chroma is ~0 there, so those pixels collapse onto the value axis instead.
+            chroma_gain = 3.0
+            chroma = cluster_data[:, 1] * cluster_data[:, 2] * chroma_gain
+            hx = np.cos(cluster_data[:, 0] * 2.0 * math.pi) * chroma
+            hy = np.sin(cluster_data[:, 0] * 2.0 * math.pi) * chroma
             cluster_data = np.stack([hx, hy, cluster_data[:, 2]], axis=1)
         else:
             cluster_data = face_colors.copy()
 
         N = cluster_data.shape[0]
         cap = min(N, max(K * 50, self.kmeans_subsample))
+        # fixed seed: the same mesh with the same settings must give the same palette, otherwise
+        # a small accent cluster appears or vanishes between runs of an unchanged model
+        rng = np.random.default_rng(42)
         if N > cap:
-            idx = np.random.choice(N, cap, replace=False)
+            idx = rng.choice(N, cap, replace=False)
             sample = cluster_data[idx]
         else:
             sample = cluster_data
@@ -4403,7 +4530,6 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             log(f'Only {n_uniq} distinct colors in the source — clamping K from {K} to {n_uniq}')
             K = max(1, n_uniq)
 
-        rng = np.random.default_rng(42)
         first = rng.integers(0, sample.shape[0])
         centers = [sample[first]]
         dist_sq = np.full(sample.shape[0], np.inf)
@@ -4434,6 +4560,67 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                 break
         log(f'K-means done in {time.time() - t_km:.1f}s')
 
+        # Collapse palette colors that are shades of one color into a single one. k-means puts
+        # slots where the surface AREA is, not where the colors differ: this relief is 74% light,
+        # so 8 clusters bring four near-identical whites (V 0.67/0.81/0.83/0.93) and the palette
+        # wastes filaments on shades a printer cannot tell apart. The freed slots are dropped,
+        # not re-spent — the point is a palette small enough to load, with the real distinctions
+        # (a dark purple accent) intact.
+        if self.collapse_similar:
+            yield ('Collapsing similar palette colors...', 48)
+            t_col = time.time()
+            rgb_c = (_sna_hsv_centers_to_rgb(centers, chroma_gain) if self.use_hsv
+                     else centers.astype(np.float32))
+            # Two colors collapse only when they are SHADES of the same hue: chroma vectors
+            # (hue x saturation x value) close together AND brightness within collapse_dist
+            # (a ratio). Plain RGB distance ranks a dark purple 0.06 away from black — farther
+            # than two whites at 0.09 — and would eat the accent instead of the spare shades.
+            hsv_c = _sna_rgb_to_hsv_np(rgb_c)
+            chroma_v = np.stack([np.cos(hsv_c[:, 0] * 2.0 * np.pi) * hsv_c[:, 1] * hsv_c[:, 2],
+                                 np.sin(hsv_c[:, 0] * 2.0 * np.pi) * hsv_c[:, 1] * hsv_c[:, 2]], axis=1)
+            d_chroma = np.sqrt(((chroma_v[:, None, :] - chroma_v[None, :, :]) ** 2).sum(axis=2))
+            # brightness as a RATIO, not a difference: 0.02 vs 0.15 is black against dark grey
+            # (different filaments), while 0.81 vs 0.93 is two whites. The 0.02 floor keeps
+            # near-black comparisons sane.
+            v_hi = np.maximum(hsv_c[:, 2][:, None], hsv_c[:, 2][None, :])
+            v_lo = np.minimum(hsv_c[:, 2][:, None], hsv_c[:, 2][None, :])
+            ratio = v_hi / np.maximum(v_lo, 0.02)
+            close = (d_chroma <= _SNA_COLLAPSE_CHROMA) & (ratio <= self.collapse_dist)
+            parent = list(range(K))
+
+            def _find(a):
+                while parent[a] != a:
+                    parent[a] = parent[parent[a]]
+                    a = parent[a]
+                return a
+
+            n_merged = 0
+            for i in range(K):
+                for j in range(i + 1, K):
+                    if close[i, j]:
+                        ri, rj = _find(i), _find(j)
+                        if ri != rj:
+                            parent[rj] = ri
+                            n_merged += 1
+            if n_merged:
+                groups = {}
+                for c in range(K):
+                    groups.setdefault(_find(c), []).append(c)
+                roots = sorted(groups)
+                new_centers = np.zeros((len(roots), centers.shape[1]), dtype=centers.dtype)
+                for ki, root in enumerate(roots):
+                    mem = groups[root]
+                    w = np.array([max(1, int((labels == c).sum())) for c in mem], dtype=np.float64)
+                    w /= w.sum()
+                    new_centers[ki] = (centers[mem] * w[:, None]).sum(axis=0)
+                centers = new_centers
+                log(f'Collapsed {n_merged} similar colors in {time.time() - t_col:.1f}s: '
+                    f'palette {K} -> {len(roots)}')
+                K = len(roots)
+                yield (f'Palette collapsed to {K} colors', 49)
+            else:
+                log(f'No palette colors within {self.collapse_dist:.2f} brightness of each other')
+
         # Phase 7: Assign each face to nearest cluster center
         yield ('Assigning faces to palette...', 50)
         t_assign = time.time()
@@ -4452,22 +4639,25 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         # Phase 8: Create materials (one per non-empty cluster)
         yield ('Creating materials...', 56)
         if self.use_hsv:
-            # Recover HSV from encoded centroids (hx=cos(H)*S, hy=sin(H)*S, V)
-            h_recovered = (np.arctan2(centers[:, 1], centers[:, 0]) / (2.0 * math.pi)) % 1.0
-            s_recovered = np.sqrt(centers[:, 0]**2 + centers[:, 1]**2)
-            s_recovered = np.clip(s_recovered, 0.0, 1.0)
-            v_recovered = centers[:, 2]
-            cluster_rgb = np.zeros((K, 3), dtype=np.float32)
-            import colorsys
-            for c in range(K):
-                r, g, b = colorsys.hsv_to_rgb(float(h_recovered[c]), float(s_recovered[c]), float(v_recovered[c]))
-                cluster_rgb[c] = (r, g, b)
+            cluster_rgb = _sna_hsv_centers_to_rgb(centers, chroma_gain)
         else:
             cluster_rgb = np.zeros((K, 3), dtype=np.float32)
             for c in range(K):
                 mask = face_labels == c
                 if mask.any():
                     cluster_rgb[c] = face_colors[mask].mean(axis=0)
+
+        if self.saturation != 1.0:
+            # Scale chroma around each palette color's own value: out = V + (rgb - V) * f is
+            # exactly HSV saturation x f with V kept; clipping at the gamut edge becomes the
+            # saturation clamp. Applied to the finished palette, not to the samples, so the
+            # slider picks filament punchiness without disturbing which colors k-means found.
+            vmax = cluster_rgb.max(axis=1, keepdims=True)
+            before = float((cluster_rgb.max(axis=1) - cluster_rgb.min(axis=1)).mean())
+            cluster_rgb = np.clip(vmax + (cluster_rgb - vmax) * self.saturation, 0.0, 1.0)
+            after = float((cluster_rgb.max(axis=1) - cluster_rgb.min(axis=1)).mean())
+            log(f'Saturation x{self.saturation:.2f} on palette: chroma mean '
+                f'{before:.4f} -> {after:.4f}')
 
         # Always mint a FRESH material datablock per cluster, per run. Blender
         # auto-suffixes the name (EBC_Voxel_000.001, ...) if taken. This keeps every
