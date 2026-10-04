@@ -135,9 +135,12 @@ cluster.
 4. Result: N material slots + N separated meshes (some clusters may be
    empty if the requested K is higher than the actual color variety in
    the texture — those are skipped).
-5. All dialog settings are remembered for the session (same as the
-   Voxel Block Remesh dialog): cancelling, reopening, and opening other
-   `.blend` files keeps your values; restarting Blender resets them.
+5. All dialog settings are remembered — cancelling, reopening, opening
+   other `.blend` files and restarting Blender all keep your values
+   (same as the Voxel Block Remesh dialog). They are stored in
+   `ebc_dialog_settings.json` inside Blender's config folder
+   (`%APPDATA%\Blender Foundation\Blender\<version>\config\`); delete
+   that file to get the defaults back.
 
 ### Result names
 

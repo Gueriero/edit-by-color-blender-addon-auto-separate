@@ -28,6 +28,7 @@ bl_info = {
 import bpy
 import bpy.utils.previews
 import os
+import json
 import bmesh
 import webbrowser
 import mathutils
@@ -2945,7 +2946,7 @@ def _sna_palette_stash_settings(op, context=None):
             store[name] = getattr(op, name)
         except Exception:
             pass
-    _SNA_DIALOG_STASH[_SNA_PALETTE_STASH_KEY] = store
+    _sna_stash_update(_SNA_PALETTE_STASH_KEY, store)
 
 
 def _sna_palette_restore_settings(op, context=None):
@@ -3185,6 +3186,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         work_obj = _sna_prepare_work_object(self, context, obj)
         if work_obj is not obj:
             print(f'[AutoPalette] Keep Original on — splitting a copy, {obj.name} stays untouched', flush=True)
+        _sna_palette_stash_settings(self, context)  # flush the last edit before the run starts
         self._gen = self._work(context, work_obj, image, uv_name, obj.name, src_faces)
         self._spin_idx = 0
         self._last_text = ''
@@ -3832,9 +3834,51 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
 #
 # Kept in a module-level dict, NOT in the window manager: WM custom properties are wiped every
 # time a .blend is opened (verified headless — set property, open_mainfile, key gone), which
-# silently reset both dialogs on every file load. Module state survives file loads and dialog
-# re-opens, and still dies with the Blender session — exactly the wanted lifetime.
+# silently reset both dialogs on every file load. The dict is mirrored to a small JSON file in
+# the Blender config dir on every change, so the values also survive a Blender restart. Delete
+# that file to get the defaults back.
+_SNA_SETTINGS_FILE = 'ebc_dialog_settings.json'
 _SNA_DIALOG_STASH = {}
+
+
+def _sna_settings_path():
+    try:
+        base = bpy.utils.user_resource('CONFIG', path='', create=True)
+    except Exception:
+        return None
+    return os.path.join(base, _SNA_SETTINGS_FILE) if base else None
+
+
+def _sna_settings_load():
+    path = _sna_settings_path()
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f'[EBC] Dialog settings file unreadable, using defaults: {e}', flush=True)
+        return {}
+
+
+def _sna_settings_save():
+    path = _sna_settings_path()
+    if not path:
+        return
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            json.dump(_SNA_DIALOG_STASH, fh, indent=1)
+    except Exception as e:
+        print(f'[EBC] Could not save dialog settings: {e}', flush=True)
+
+
+def _sna_stash_update(key, store):
+    """Write one operator's settings into the session dict, saving to disk only on change."""
+    if _SNA_DIALOG_STASH.get(key) == store:
+        return
+    _SNA_DIALOG_STASH[key] = store
+    _sna_settings_save()
 _SNA_VOXEL_PERSIST = (
     'cell_size_mm', 'num_colors', 'kmeans_iters', 'kmeans_subsample', 'use_hsv', 'do_separate',
     'remove_original', 'merge_verts', 'fill_open_edges', 'fix_checker', 'collapse_similar',
@@ -3864,7 +3908,7 @@ def _sna_voxel_stash_settings(op, context=None):
             store[name] = getattr(op, name)
         except Exception:
             pass
-    _SNA_DIALOG_STASH[_SNA_VOXEL_STASH_KEY] = store
+    _sna_stash_update(_SNA_VOXEL_STASH_KEY, store)
 
 
 def _sna_voxel_restore_settings(op, context=None):
@@ -4044,6 +4088,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             if image.size[0] == 0 or image.size[1] == 0:
                 self.report({'ERROR'}, 'Image has zero size'); return {'CANCELLED'}
 
+        _sna_voxel_stash_settings(self, context)   # flush the last edit before the run starts
         self._gen = self._work(context, obj, image, uv_name)
         self._spin_idx = 0
         self._last_text = ''
@@ -5926,9 +5971,10 @@ class SNA_OT_test_dialog_stash(bpy.types.Operator):
     bl_idname = 'sna.test_dialog_stash'
     bl_label = 'Self-Test: Dialog Settings Stash'
     bl_description = ('Round-trips the remembered dialog settings of the voxel and palette operators: writes '
-                      'non-default values through the update callback, restores them into a fresh instance, and '
-                      'asserts the stash lives in the addon module rather than the window manager (WM custom '
-                      'properties are wiped on every file load). Reports PASS/FAIL in console')
+                      'non-default values through the update callback, restores them into a fresh instance, '
+                      'checks the JSON in the config dir carries them across a simulated Blender restart, and '
+                      'asserts the stash does not live in the window manager (WM props are wiped on file load). '
+                      'The real settings file is backed up and restored. Reports PASS/FAIL in console')
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -5974,6 +6020,46 @@ class SNA_OT_test_dialog_stash(bpy.types.Operator):
             in_wm = key in context.window_manager
             p(f'{label}: {len(persist)} props, mismatched={mismatched}, still in WM={in_wm}')
             ok = ok and not mismatched and not in_wm
+
+        # cross-session part: a fresh Blender loads the dict from the JSON file in the config dir.
+        # The file is the user's real one, so put it back exactly as found afterwards.
+        path = _sna_settings_path()
+        backup = None
+        try:
+            if path and os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as fh:
+                    backup = fh.read()
+            disk = _sna_settings_load()
+            ok_keys = all(k in disk for k in (_SNA_VOXEL_STASH_KEY, _SNA_PALETTE_STASH_KEY))
+            p(f'settings file: {path}')
+            p(f'file has both operator keys: {ok_keys} ({"saved" if path and os.path.exists(path) else "MISSING"})')
+            ok = ok and ok_keys and bool(path) and os.path.exists(path)
+
+            # simulate a restart: drop the session dict, reload from disk, restore into a fresh op
+            session = dict(_SNA_DIALOG_STASH)
+            _SNA_DIALOG_STASH.clear()
+            _SNA_DIALOG_STASH.update(_sna_settings_load())
+            reloaded_op = _Stub()
+            props = rna_of(SNA_OT_voxel_block_remesh).properties
+            for name in _SNA_VOXEL_PERSIST:
+                setattr(reloaded_op, name, props[name].default)
+            _sna_voxel_restore_settings(reloaded_op, context)
+            survived = [n for n in _SNA_VOXEL_PERSIST
+                        if getattr(reloaded_op, n) != session[_SNA_VOXEL_STASH_KEY][n]]
+            p(f'survives simulated restart: {not survived} (mismatched={survived})')
+            ok = ok and not survived
+            _SNA_DIALOG_STASH.clear()
+            _SNA_DIALOG_STASH.update(session)
+        except Exception as e:
+            p(f'settings-file check failed: {type(e).__name__}: {e}')
+            ok = False
+        finally:
+            if path and backup is not None:
+                try:
+                    with open(path, 'w', encoding='utf-8') as fh:
+                        fh.write(backup)
+                except Exception as e:
+                    p(f'could not restore the settings file: {e}')
 
         if ok:
             p('=== PASS ===')
@@ -6078,6 +6164,7 @@ def sna_bake_materials_interface(layout_function):
 
 def register():
     global _icons
+    _SNA_DIALOG_STASH.update(_sna_settings_load())
     _icons = bpy.utils.previews.new()
     bpy.types.Scene.sna_ebc_colour_selection = bpy.props.FloatVectorProperty(name='EBC_Colour_Selection', description='', size=4, default=(0.0, 0.0, 0.0, 0.0), subtype='COLOR', unit='NONE', step=3, precision=6)
     bpy.types.Scene.sna_ebc_active_menu_full = bpy.props.EnumProperty(name='EBC_Active_Menu_Full', description='', items=[('Colour Selection', 'Colour Selection', '', 0, 0), ('Texture', 'Texture', '', 0, 1), ('Edit Mesh', 'Edit Mesh', '', 0, 2), ('Sculpt', 'Sculpt', '', 0, 3)])
