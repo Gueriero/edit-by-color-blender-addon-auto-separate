@@ -5996,6 +5996,17 @@ class SNA_OT_test_dialog_stash(bpy.types.Operator):
             ('palette', SNA_OT_auto_palette_split, _SNA_PALETTE_PERSIST, _SNA_PALETTE_STASH_KEY,
              _sna_palette_stash_settings, _sna_palette_restore_settings),
         )
+        # snapshot the real settings file BEFORE the first stash — the callbacks write to it
+        path = _sna_settings_path()
+        backup = None
+        session = dict(_SNA_DIALOG_STASH)
+        expected_by_key = {}
+        if path and os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as fh:
+                    backup = fh.read()
+            except Exception as e:
+                p(f'could not back up the settings file: {e}')
         for label, cls, persist, key, stash_fn, restore_fn in cases:
             props = rna_of(cls).properties
             op = _Stub()
@@ -6017,18 +6028,13 @@ class SNA_OT_test_dialog_stash(bpy.types.Operator):
                 setattr(fresh, name, props[name].default)
             restore_fn(fresh, context)
             mismatched = [n for n in persist if getattr(fresh, n) != expect[n]]
+            expected_by_key[key] = expect
             in_wm = key in context.window_manager
             p(f'{label}: {len(persist)} props, mismatched={mismatched}, still in WM={in_wm}')
             ok = ok and not mismatched and not in_wm
 
-        # cross-session part: a fresh Blender loads the dict from the JSON file in the config dir.
-        # The file is the user's real one, so put it back exactly as found afterwards.
-        path = _sna_settings_path()
-        backup = None
+        # cross-session part: a fresh Blender loads the dict from the JSON file in the config dir
         try:
-            if path and os.path.exists(path):
-                with open(path, 'r', encoding='utf-8') as fh:
-                    backup = fh.read()
             disk = _sna_settings_load()
             ok_keys = all(k in disk for k in (_SNA_VOXEL_STASH_KEY, _SNA_PALETTE_STASH_KEY))
             p(f'settings file: {path}')
@@ -6036,7 +6042,6 @@ class SNA_OT_test_dialog_stash(bpy.types.Operator):
             ok = ok and ok_keys and bool(path) and os.path.exists(path)
 
             # simulate a restart: drop the session dict, reload from disk, restore into a fresh op
-            session = dict(_SNA_DIALOG_STASH)
             _SNA_DIALOG_STASH.clear()
             _SNA_DIALOG_STASH.update(_sna_settings_load())
             reloaded_op = _Stub()
@@ -6044,22 +6049,28 @@ class SNA_OT_test_dialog_stash(bpy.types.Operator):
             for name in _SNA_VOXEL_PERSIST:
                 setattr(reloaded_op, name, props[name].default)
             _sna_voxel_restore_settings(reloaded_op, context)
+            expected = expected_by_key[_SNA_VOXEL_STASH_KEY]
             survived = [n for n in _SNA_VOXEL_PERSIST
-                        if getattr(reloaded_op, n) != session[_SNA_VOXEL_STASH_KEY][n]]
+                        if getattr(reloaded_op, n) != expected[n]]
             p(f'survives simulated restart: {not survived} (mismatched={survived})')
             ok = ok and not survived
-            _SNA_DIALOG_STASH.clear()
-            _SNA_DIALOG_STASH.update(session)
         except Exception as e:
             p(f'settings-file check failed: {type(e).__name__}: {e}')
             ok = False
         finally:
-            if path and backup is not None:
-                try:
+            _SNA_DIALOG_STASH.clear()
+            _SNA_DIALOG_STASH.update(session)
+            # put the user's file back exactly as it was before the test touched it
+            try:
+                if path and backup is not None:
                     with open(path, 'w', encoding='utf-8') as fh:
                         fh.write(backup)
-                except Exception as e:
-                    p(f'could not restore the settings file: {e}')
+                    p('settings file restored')
+                elif path and os.path.exists(path):
+                    os.remove(path)
+                    p('settings file removed (did not exist before the test)')
+            except Exception as e:
+                p(f'could not restore the settings file: {e}')
 
         if ok:
             p('=== PASS ===')
