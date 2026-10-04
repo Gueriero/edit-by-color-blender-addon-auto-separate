@@ -2924,6 +2924,138 @@ class SNA_OT_palette_split_and_colorize(bpy.types.Operator):
         layout.prop(self, 'do_separate')
 
 
+# Auto Palette Split dialog settings, remembered for the rest of the session — same lifetime
+# rule as the voxel operator: survive cancel-and-reopen, back to defaults after Blender exits.
+_SNA_PALETTE_PERSIST = (
+    'num_clusters', 'samples_per_face', 'use_hsv', 'do_separate', 'progressive_separate',
+    'remove_modifier', 'solidify_thickness', 'merge_small_islands', 'min_island_size_x',
+    'min_island_size_y', 'min_island_size_z', 'min_island_face_count', 'min_island_feature_width',
+    'merge_max_iters', 'erosion_passes', 'erosion_strength', 'kmeans_iters', 'kmeans_subsample',
+    'keep_original',
+)
+_SNA_PALETTE_STASH_KEY = 'sna_palette_last_settings'
+
+
+def _sna_palette_stash_settings(op, context=None):
+    if not getattr(op, '_dialog_open', False):
+        return
+    try:
+        wm = (context if context is not None else bpy.context).window_manager
+    except Exception:
+        return
+    store = {}
+    for name in _SNA_PALETTE_PERSIST:
+        try:
+            store[name] = getattr(op, name)
+        except Exception:
+            pass
+    try:
+        wm[_SNA_PALETTE_STASH_KEY] = store
+    except Exception:
+        pass
+
+
+def _sna_palette_restore_settings(op, context=None):
+    try:
+        wm = (context if context is not None else bpy.context).window_manager
+        store = wm.get(_SNA_PALETTE_STASH_KEY)
+    except Exception:
+        return
+    if not store:
+        return
+    for name in _SNA_PALETTE_PERSIST:
+        if name in store:
+            try:
+                setattr(op, name, store[name])
+            except Exception:
+                pass
+
+
+def _sna_compact_count(n):
+    if n >= 1_000_000:
+        return f'{n / 1e6:.1f}M'.replace('.0M', 'M')
+    if n >= 1_000:
+        return f'{n / 1e3:.0f}k'
+    return str(int(n))
+
+
+def _sna_palette_result_name(op, src_name, src_faces, n_clusters):
+    """Metric name for the split pieces, following the voxel convention:
+    <settings>_<model stats>_<source>_Split, e.g. PAL_K12_s4_hsv_mer_ero2_F1.5M_Can_Split.
+    """
+    parts = [f'PAL_K{n_clusters}', f's{int(op.samples_per_face)}', 'hsv' if op.use_hsv else 'rgb']
+    if getattr(op, 'merge_small_islands', False):
+        parts.append('mer')
+    ero = int(getattr(op, 'erosion_passes', 0) or 0)
+    if ero > 0:
+        parts.append(f'ero{ero}')
+    parts.append(f'F{_sna_compact_count(src_faces)}')
+    prefix = '_'.join(parts) + '_'
+    suffix = '_Split'
+    # Blender caps object names at 63 bytes — clip the source name, never the metrics
+    room = max(1, 63 - len(prefix) - len(suffix))
+    return f'{prefix}{src_name[:room]}{suffix}'
+
+
+def _sna_prepare_work_object(op, context, obj):
+    """Object the pipeline runs on. With Keep Original on this is a full copy (mesh +
+    modifier stack + collection links); the original keeps its texture modifier untouched,
+    so the same object can be re-run with different settings.
+    """
+    if not getattr(op, 'keep_original', False):
+        return obj
+    # A cancelled or failed earlier run leaves its copy behind — sweep those away, but only
+    # copies we made for this same source (marker is cleared once a run separates them).
+    for stale in list(bpy.data.objects):
+        try:
+            if stale.get('_ebc_split_tmp') and stale.get('_ebc_split_src') == obj.name:
+                print(f'[AutoPalette] Removing leftover copy from an interrupted run: {stale.name}',
+                      flush=True)
+                bpy.data.objects.remove(stale, do_unlink=True)
+        except Exception:
+            pass
+    work = obj.copy()
+    work.data = obj.data.copy()
+    work.name = obj.name + '_EBC_split'
+    work['_ebc_split_tmp'] = True
+    work['_ebc_split_src'] = obj.name
+    colls = list(obj.users_collection)
+    if colls:
+        for coll in colls:
+            coll.objects.link(work)
+    else:
+        context.collection.objects.link(work)
+    return work
+
+
+def _sna_piece_cluster(piece):
+    """Cluster index of a split piece, read back from its EBC_Auto_NNN material."""
+    mesh = getattr(piece, 'data', None)
+    if mesh is None or not len(mesh.polygons):
+        return 10 ** 6
+    mi = mesh.polygons[0].material_index
+    if mi < len(piece.material_slots):
+        mat = piece.material_slots[mi].material
+        if mat is not None:
+            tail = mat.name.rsplit('_', 1)[-1]
+            if tail.isdigit():
+                return int(tail)
+    return 10 ** 6
+
+
+def _sna_rename_split_results(root, new_objs, base_name, log):
+    """Name every piece after the run metrics. Ordering is by cluster index read back
+    from each piece's material, so identical settings + texture give identical names.
+    """
+    pieces = [o for o in ([root] + list(new_objs)) if o.type == 'MESH']
+    pieces.sort(key=_sna_piece_cluster)
+    for i, o in enumerate(pieces):
+        name = base_name if i == 0 else f'{base_name}.{i:03d}'
+        o.data.name = name
+        o.name = name
+    log(f'Named {len(pieces)} pieces: {base_name}[.NNN]')
+
+
 class SNA_OT_auto_palette_split(bpy.types.Operator):
     bl_idname = 'sna.auto_palette_split'
     bl_label = 'Auto Palette Split'
@@ -2931,77 +3063,100 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     num_clusters: bpy.props.IntProperty(
+        update=_sna_palette_stash_settings,
         name='Total Colors', default=16, min=2, max=256,
         description='How many color buckets to produce (each becomes one material / mesh)',
     )
     samples_per_face: bpy.props.IntProperty(
+        update=_sna_palette_stash_settings,
         name='Samples per Face', default=4, min=1, max=64,
         description='Barycentric samples averaged per face',
     )
     kmeans_iters: bpy.props.IntProperty(
+        update=_sna_palette_stash_settings,
         name='K-means Iterations', default=20, min=2, max=100,
     )
     kmeans_subsample: bpy.props.IntProperty(
+        update=_sna_palette_stash_settings,
         name='Cluster Sample Cap', default=20000, min=500, max=200000,
         description='Cap number of faces used to compute clusters (random subsample). Speeds up large meshes',
     )
     use_hsv: bpy.props.BoolProperty(
+        update=_sna_palette_stash_settings,
         name='Cluster in HSV', default=True,
         description='K-means in HSV space (better perceptual grouping). Off = RGB',
     )
     do_separate: bpy.props.BoolProperty(
+        update=_sna_palette_stash_settings,
         name='Separate by Material', default=True,
     )
     remove_modifier: bpy.props.BoolProperty(
+        update=_sna_palette_stash_settings,
         name='Remove EBC Modifier after Split', default=True,
         description='Removes the KIRI_Edit_By_Colour_GN modifier from the result objects so their EBC_Auto materials show correctly',
     )
+    keep_original: bpy.props.BoolProperty(
+        update=_sna_palette_stash_settings,
+        name='Keep Original', default=True,
+        description='Run the whole split on a full copy (mesh + modifier) and leave the original object in the scene untouched, so it can be re-split with other settings. Off = legacy in-place behavior: the original object becomes one of the split pieces',
+    )
     progressive_separate: bpy.props.BoolProperty(
+        update=_sna_palette_stash_settings,
         name='Progressive Separate (logged)', default=False,
         description='Separate materials one by one with a console log per cluster. Slower but shows progress. Off = single fast bpy.ops.mesh.separate(MATERIAL) with no progress',
     )
     solidify_thickness: bpy.props.FloatProperty(
+        update=_sna_palette_stash_settings,
         name='Solidify Thickness', default=0.0, min=0.0, max=100.0,
         description='If > 0, add a Solidify modifier to the source object before separation so each result piece becomes a closed volume for 3D printing. Recommend 0.4mm (nozzle width) to 1mm. Disabled when 0',
         unit='LENGTH', precision=3, step=10,
     )
     merge_small_islands: bpy.props.BoolProperty(
+        update=_sna_palette_stash_settings,
         name='Merge Small Islands', default=False,
         description='Find connected face regions per cluster; islands smaller than the threshold get merged into their majority neighbor cluster before separation. Reduces tiny print artifacts',
     )
     min_island_size_x: bpy.props.FloatProperty(
+        update=_sna_palette_stash_settings,
         name='Min X', default=0.003, min=0.0, max=10.0,
         description='Minimum bbox extent along X for an island, in scene units. 0 disables the X check',
         unit='LENGTH', precision=4,
     )
     min_island_size_y: bpy.props.FloatProperty(
+        update=_sna_palette_stash_settings,
         name='Min Y', default=0.003, min=0.0, max=10.0,
         description='Minimum bbox extent along Y for an island, in scene units. 0 disables the Y check',
         unit='LENGTH', precision=4,
     )
     min_island_size_z: bpy.props.FloatProperty(
+        update=_sna_palette_stash_settings,
         name='Min Z', default=0.0, min=0.0, max=10.0,
         description='Minimum bbox extent along Z for an island, in scene units. 0 disables the Z check',
         unit='LENGTH', precision=4,
     )
     min_island_face_count: bpy.props.IntProperty(
+        update=_sna_palette_stash_settings,
         name='Min Island Faces', default=20, min=0, max=100000,
         description='Islands with fewer than this many faces are merged regardless of size. Safeguard against degenerate slivers',
     )
     min_island_feature_width: bpy.props.FloatProperty(
+        update=_sna_palette_stash_settings,
         name='Min Feature Width (OBB)', default=0.0, min=0.0, max=10.0,
         description='Minimum width along the smallest principal axis (oriented bounding box). Catches thin features regardless of orientation. 0 = disabled. Recommended 3mm for 0.4mm nozzle prints',
         unit='LENGTH', precision=4,
     )
     merge_max_iters: bpy.props.IntProperty(
+        update=_sna_palette_stash_settings,
         name='Merge Iterations', default=8, min=1, max=30,
         description='Repeat the small-island merge pass up to N times. Each iteration recomputes connected components on the updated labels — small clusters cascade-absorb into larger neighbors. Stops early on convergence. 1 = legacy single-pass behavior',
     )
     erosion_passes: bpy.props.IntProperty(
+        update=_sna_palette_stash_settings,
         name='Erosion Passes', default=0, min=0, max=20,
         description='After bbox-based merging, run N morphological erosion passes. Each pass flips faces whose same-cluster neighbor fraction is below the strength threshold. 1-3 passes typical, 5+ for aggressive smoothing',
     )
     erosion_strength: bpy.props.FloatProperty(
+        update=_sna_palette_stash_settings,
         name='Erosion Strength', default=0.7, min=0.5, max=0.99, precision=2,
         description='Flip face if (same-cluster neighbors / total neighbors) < this value. 0.5 = strict minority only (cant erode 1-face wide strips on triangulated meshes since they have 2/3 same neighbors). 0.7 = catches 1-face strips on triangles. 0.8+ erodes wider features faster',
     )
@@ -3009,6 +3164,8 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
     _SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
     def invoke(self, context, event):
+        self._dialog_open = True
+        _sna_palette_restore_settings(self, context)
         return context.window_manager.invoke_props_dialog(self, width=380)
 
     def execute(self, context):
@@ -3035,7 +3192,11 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         if image.size[0] == 0 or image.size[1] == 0:
             self.report({'ERROR'}, 'Image has zero size'); return {'CANCELLED'}
 
-        self._gen = self._work(context, obj, image, uv_name)
+        src_faces = len(obj.data.polygons)
+        work_obj = _sna_prepare_work_object(self, context, obj)
+        if work_obj is not obj:
+            print(f'[AutoPalette] Keep Original on — splitting a copy, {obj.name} stays untouched', flush=True)
+        self._gen = self._work(context, work_obj, image, uv_name, obj.name, src_faces)
         self._spin_idx = 0
         self._last_text = ''
         # advance once so the first status is visible immediately
@@ -3112,8 +3273,12 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         except Exception:
             pass
 
-    def _work(self, context, obj, image, uv_name):
-        """Generator: yields ('text', pct 0..100) or just 'text'. Each yield = UI tick."""
+    def _work(self, context, obj, image, uv_name, src_name=None, src_faces=None):
+        """Generator: yields ('text', pct 0..100) or just 'text'. Each yield = UI tick.
+
+        obj is the object being split (a copy when Keep Original is on); src_name/src_faces
+        describe the original and only feed the result names.
+        """
         import math, colorsys, time
         import numpy as np
 
@@ -3330,6 +3495,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             mod.use_quality_normals = True
             log(f'Added Solidify modifier (thickness={solidify_mm*1000:.1f}mm)')
 
+        sep_objs = []
         if self.do_separate and self.progressive_separate:
             log('Progressive separate via material_slot_select...')
             t_sep = time.time()
@@ -3355,6 +3521,7 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
                     objs_before = set(bpy.data.objects)
                     bpy.ops.mesh.separate(type='SELECTED')
                     new_objs = set(bpy.data.objects) - objs_before
+                    sep_objs.extend(new_objs)
                     n_new = sum(len(o.data.polygons) for o in new_objs)
                     elapsed = time.time() - t_sep
                     eta = elapsed * (total - (ki + 1)) / max(ki + 1, 1)
@@ -3375,12 +3542,29 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
             context.view_layer.objects.active = obj
             bpy.ops.object.mode_set(mode='EDIT')
             bpy.ops.mesh.select_all(action='SELECT')
+            objs_before = set(bpy.data.objects)
             try:
                 bpy.ops.mesh.separate(type='MATERIAL')
             except RuntimeError as e:
                 log(f'Separate failed: {e}')
+            sep_objs.extend(set(bpy.data.objects) - objs_before)
             bpy.ops.object.mode_set(mode='OBJECT')
             log(f'Separation done in {time.time() - t_sep:.1f}s')
+
+        base_name = _sna_palette_result_name(self, src_name or obj.name, src_faces or n_polys,
+                                             len(slot_map))
+        try:
+            _sna_rename_split_results(obj, sep_objs, base_name, log)
+        except Exception as e:
+            log(f'Rename failed: {type(e).__name__}: {e} (pieces keep their default names)')
+        # pieces are the finished article now — drop the interrupted-run markers
+        for piece in [obj] + list(sep_objs):
+            try:
+                del piece['_ebc_split_tmp']
+                del piece['_ebc_split_src']
+            except Exception:
+                pass
+        yield (f'Named {base_name}', 99)
 
         log(f'=== DONE in {time.time() - t_start:.1f}s — {len(slot_map)} non-empty clusters of {K} ===')
         yield (f'Done — {len(slot_map)} clusters', 100)
@@ -5589,6 +5773,173 @@ class SNA_OT_test_merge_islands(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SNA_OT_test_keep_original(bpy.types.Operator):
+    bl_idname = 'sna.test_keep_original'
+    bl_label = 'Self-Test: Keep Original + Metric Names'
+    bl_description = ('Builds a 4-face plane painted from a 4-quadrant test image and runs the Auto Palette Split '
+                      'pipeline on a copy (keep_original=True). Asserts the original object keeps its faces, name and '
+                      '(lack of) split materials, that the copy is a separate mesh, and that every split piece carries '
+                      'the PAL_K..._F..._<src>_Split metric name. Reports PASS/FAIL in console')
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            import numpy as np
+        except Exception:
+            self.report({'ERROR'}, 'numpy not available')
+            return {'CANCELLED'}
+
+        def p(msg):
+            print(f'[TestKeepOrig] {msg}', flush=True)
+
+        p('=== test start ===')
+        img = None
+        plane = None
+        created = []
+        try:
+            bpy.ops.object.select_all(action='DESELECT')
+
+            img = bpy.data.images.new('_ebc_test_keep_img', width=8, height=8, alpha=False)
+            px = np.zeros((8, 8, 4), dtype=np.float32)
+            px[:, :, 3] = 1.0
+            px[0:4, 0:4, 0] = 1.0            # top-left red
+            px[0:4, 4:8, 1] = 1.0            # top-right green
+            px[4:8, 0:4, 2] = 1.0            # bottom-left blue
+            px[4:8, 4:8, :3] = 1.0           # bottom-right white
+            img.pixels.foreach_set(px.reshape(-1))
+            img.update()
+
+            bpy.ops.mesh.primitive_plane_add(size=0.2, location=(50, 50, 50))
+            plane = context.active_object
+            plane.name = '_ebc_test_keep_plane'
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.subdivide(number_cuts=1)
+            bpy.ops.object.mode_set(mode='OBJECT')
+            mesh = plane.data
+            uv = mesh.uv_layers.new(name='TestUV')
+            centers = [(0.25, 0.75), (0.75, 0.75), (0.25, 0.25), (0.75, 0.25)]
+            for pi, poly in enumerate(mesh.polygons):
+                u, v = centers[pi % 4]
+                for li in poly.loop_indices:
+                    uv.data[li].uv = (u, v)
+            n_faces_before = len(mesh.polygons)
+            p(f'plane: {n_faces_before} polys (expected 4)')
+
+            class _Stub:
+                def report(self, *a, **k):
+                    pass
+
+            op = _Stub()
+            op.num_clusters = 4
+            op.samples_per_face = 1
+            op.use_hsv = False
+            op.do_separate = True
+            op.progressive_separate = False
+            op.remove_modifier = False
+            op.keep_original = True
+            op.merge_small_islands = False
+            op.erosion_passes = 0
+            op.erosion_strength = 0.7
+            op.solidify_thickness = 0.0
+            op.kmeans_iters = 20
+            op.kmeans_subsample = 20000
+
+            objs_before = set(bpy.data.objects)
+            work = _sna_prepare_work_object(op, context, plane)
+            ok_copy = work is not plane and work.data is not mesh
+            p(f'work object: {work.name} (copy={ok_copy})')
+            for _ in SNA_OT_auto_palette_split._work(op, context, work, img, 'TestUV',
+                                                     plane.name, n_faces_before):
+                pass
+
+            new_objs = [o for o in bpy.data.objects if o not in objs_before]
+            created.extend(new_objs)
+            p(f'new objects after pipeline: {[o.name for o in new_objs]}')
+
+            base = _sna_palette_result_name(op, plane.name, n_faces_before, 4)
+            names = sorted(o.name for o in new_objs if o.type == 'MESH')
+            faces_total = sum(len(o.data.polygons) for o in new_objs if o.type == 'MESH')
+            ok_names = len(names) == 4 and names[0] == base and all(n.startswith(base) for n in names)
+            ok_faces = faces_total == n_faces_before
+            ok_orig = (len(plane.data.polygons) == n_faces_before
+                       and plane.name == '_ebc_test_keep_plane'
+                       and len(plane.material_slots) == 0)
+            p(f'base name: {base}')
+            p(f'piece names: {names}')
+            p(f'faces total={faces_total} (expected {n_faces_before}), orig_ok={ok_orig}')
+
+            op.keep_original = False
+            same = _sna_prepare_work_object(op, context, plane)
+            ok_no_copy = same is plane
+            p(f'keep_original=False returns same object: {ok_no_copy}')
+
+            # legacy path: no copy — the original object itself becomes a piece, but still renamed
+            bpy.ops.mesh.primitive_plane_add(size=0.2, location=(60, 60, 60))
+            plane2 = context.active_object
+            plane2.name = '_ebc_test_keep_plane2'
+            created.append(plane2)
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.subdivide(number_cuts=1)
+            bpy.ops.object.mode_set(mode='OBJECT')
+            uv2 = plane2.data.uv_layers.new(name='TestUV')
+            for pi, poly in enumerate(plane2.data.polygons):
+                u, v = centers[pi % 4]
+                for li in poly.loop_indices:
+                    uv2.data[li].uv = (u, v)
+            objs_before2 = set(bpy.data.objects)
+            for _ in SNA_OT_auto_palette_split._work(op, context, plane2, img, 'TestUV',
+                                                     plane2.name, 4):
+                pass
+            pieces2 = [o for o in set(bpy.data.objects) - objs_before2] + [plane2]
+            created.extend(o for o in pieces2 if o not in created)
+            ok_inplace = (plane2.name.startswith('PAL_')
+                          and sum(len(o.data.polygons) for o in pieces2 if o.type == 'MESH') == 4)
+            p(f'legacy in-place: root renamed to {plane2.name}, faces={sum(len(o.data.polygons) for o in pieces2 if o.type == "MESH")}')
+
+            leftovers = [o.name for o in bpy.data.objects if o.get('_ebc_split_tmp')]
+            # a stale marked copy must be swept by the next run for the same source
+            stale_probe = plane.copy()
+            stale_probe.data = plane.data
+            stale_probe['_ebc_split_tmp'] = True
+            stale_probe['_ebc_split_src'] = plane.name
+            stale_name = stale_probe.name
+            context.scene.collection.objects.link(stale_probe)
+            op.keep_original = True
+            swept = _sna_prepare_work_object(op, context, plane)
+            ok_sweep = (bpy.data.objects.get(stale_name) is None
+                        and swept.get('_ebc_split_tmp', None) is True)
+            if swept is not plane:
+                created.append(swept)
+            bpy.data.objects.remove(swept, do_unlink=True)
+            op.keep_original = False
+            p(f'leftover markers after run: {leftovers} (expected [])')
+
+            ok = (ok_copy and ok_no_copy and ok_names and ok_faces and ok_orig and ok_inplace
+                  and not leftovers and ok_sweep)
+            if ok:
+                p('=== PASS ===')
+                self.report({'INFO'}, 'TestKeepOriginal PASS')
+            else:
+                p(f'=== FAIL: copy={ok_copy} no_copy={ok_no_copy} names={ok_names} '
+                  f'faces={ok_faces} orig={ok_orig} inplace={ok_inplace} ===')
+                self.report({'ERROR'}, 'TestKeepOriginal FAIL')
+            return {'FINISHED' if ok else 'CANCELLED'}
+        except Exception as e:
+            p(f'=== FAIL: {type(e).__name__}: {e} ===')
+            self.report({'ERROR'}, f'TestKeepOriginal FAIL: {type(e).__name__}: {e}')
+            return {'CANCELLED'}
+        finally:
+            for o in created:
+                try: bpy.data.objects.remove(o, do_unlink=True)
+                except Exception: pass
+            if plane is not None:
+                try: bpy.data.objects.remove(plane, do_unlink=True)
+                except Exception: pass
+            if img is not None:
+                try: bpy.data.images.remove(img, do_unlink=True)
+                except Exception: pass
+
+
 class SNA_OT_remove_ebc_modifier_from_selected(bpy.types.Operator):
     bl_idname = 'sna.remove_ebc_modifier_from_selected'
     bl_label = 'Remove EBC Modifier from Selected'
@@ -5725,6 +6076,7 @@ def register():
     bpy.utils.register_class(SNA_OT_remove_ebc_modifier_from_selected)
     bpy.utils.register_class(SNA_OT_test_progressive_separate)
     bpy.utils.register_class(SNA_OT_test_merge_islands)
+    bpy.utils.register_class(SNA_OT_test_keep_original)
     bpy.utils.register_class(SNA_OT_voxel_block_remesh)
     bpy.utils.register_class(SNA_OT_test_voxel_block_remesh)
     bpy.utils.register_class(SNA_OT_bake_materials_to_texture)
@@ -5803,6 +6155,7 @@ def unregister():
     del bpy.types.Scene.sna_palette_active_index
     del bpy.types.Scene.sna_palette_colors
     bpy.utils.unregister_class(SNA_OT_test_merge_islands)
+    bpy.utils.unregister_class(SNA_OT_test_keep_original)
     bpy.utils.unregister_class(SNA_OT_bake_materials_to_texture)
     bpy.utils.unregister_class(SNA_OT_test_voxel_block_remesh)
     bpy.utils.unregister_class(SNA_OT_voxel_block_remesh)

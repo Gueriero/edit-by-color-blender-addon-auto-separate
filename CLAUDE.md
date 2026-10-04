@@ -64,6 +64,7 @@ try {
 Класс `SNA_OT_auto_palette_split`. **Модальный оператор с генератором** — `_work(...)` yield-ит `(text, pct)`, `modal()` тикает таймером 0.08s, обновляет `context.workspace.status_text_set` со спиннером + ESC отменяет. Это единственный способ показать live UI во время блокирующего Python.
 
 Pipeline (фазы):
+0. **Keep Original** (дефолт вкл, `_sna_prepare_work_object`) — копия объекта (mesh + modifier stack) в те же коллекции; весь пайплайн идёт на копии, оригинал остаётся нетронутым вместе с KIRI-модификатором. Пик памяти ≈ 2× меш. Off = legacy in-place
 1. Read image pixels (numpy `foreach_get`)
 2. Sample per-face avg color (барицентрика по UV)
 3. HSV transform (hue → cos/sin для евклидова k-means)
@@ -74,6 +75,9 @@ Pipeline (фазы):
 8. Write `material_index` через `foreach_set` + numpy lookup table
 9. Remove KIRI modifier (опционально)
 10. Separate — атомарный `mesh.separate(MATERIAL)` или Progressive (per-cluster логи)
+11. Rename кусков по метрикам прогона (`_sna_palette_result_name` + `_sna_rename_split_results`): `PAL_K{k}_s{samples}_{hsv|rgb}[_mer][_ero{N}]_F{faces}_{src}_Split`, сортировка по cluster index (материал `EBC_Auto_NNN` первого полигона), лимит имени 63 байта — режется src
+
+Диалог помнит настройки на сессию (`_sna_palette_stash_settings`, ключ `sna_palette_last_settings`) — тот же паттерн что у вокселя. Тест: `sna.test_keep_original` (F3).
 
 ### Merge Small Islands — фильтры
 

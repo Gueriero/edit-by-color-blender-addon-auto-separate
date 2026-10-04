@@ -117,16 +117,48 @@ cluster.
    - **Samples per Face** — barycentric sample density (default 4).
    - **Cluster in HSV** — recommended on; off uses raw RGB euclidean.
    - **Separate by Material** — produce one mesh per cluster.
+   - **Keep Original** (default on) — the split runs on a full copy
+     (mesh + modifier stack) linked into the same collections; the
+     original object stays in the scene exactly as it was, modifier
+     intact, so you can re-run with other settings. Turn it off for the
+     legacy in-place behavior, where the original object itself becomes
+     one of the pieces. Note the copy roughly doubles peak memory on
+     multi-million-poly meshes.
    - **Remove EBC Modifier after Split** — drops the
-     `KIRI_Edit_By_Colour_GN` modifier from the source object before
-     separating, so the resulting child meshes do not inherit the
+     `KIRI_Edit_By_Colour_GN` modifier from the object being split
+     before separating, so the resulting child meshes do not inherit the
      placeholder `KIRI_LOGO` Live Effect material that would otherwise
-     visually override your `EBC_Auto_*` colors.
+     visually override your `EBC_Auto_*` colors. With **Keep Original**
+     on this only touches the copy — the original keeps its modifier.
    - Advanced: **K-means Iterations**, **Cluster Sample Cap** (random
      subsample of faces used to fit centroids — speeds up huge meshes).
 4. Result: N material slots + N separated meshes (some clusters may be
    empty if the requested K is higher than the actual color variety in
    the texture — those are skipped).
+5. All dialog settings are remembered for the session (same as the
+   Voxel Block Remesh dialog): cancelling and reopening keeps your
+   values, restarting Blender resets them.
+
+### Result names
+
+Every piece is named after the run metrics, following the voxel
+convention, so the Outliner tells you which settings produced which
+mesh:
+
+```
+PAL_K12_s4_hsv_mer_ero2_F1.5M_MyModel_Split
+│   │   │   │   │   │    └ source object name
+│   │   │   │   │   └─── polygons in the source mesh
+│   │   │   │   └─────── ero2: 2 erosion passes
+│   │   │   └─────────── mer: Merge Small Islands was on
+│   │   └─────────────── hsv/rgb clustering space
+│   └─────────────────── samples per face
+└─────────────────────── non-empty clusters produced
+```
+
+Pieces get the suffixes Blender assigns after the first: `..._Split`,
+`..._Split.001`, `..._Split.002` — ordered by cluster index, so the same
+settings and texture give the same ordering on every run.
 
 ### Progress logging
 The operator prints staged progress to the Blender system console
