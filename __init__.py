@@ -3666,6 +3666,11 @@ _SNA_VOXEL_PERSIST = (
 )
 _SNA_VOXEL_STASH_KEY = 'sna_voxel_last_settings'
 
+# The occupancy work is done in dense numpy grids (~6 one-byte arrays live at once, plus the
+# per-face python list later). Cells grow with the CUBE of the inverse block size, so a 30cm
+# relief at 0.1mm would ask for 2.2 billion of them. Refuse before allocating anything.
+_SNA_VOXEL_MAX_CELLS = 200_000_000
+
 
 def _sna_voxel_stash_settings(op, context=None):
     """Property update callback: mirror every edited value onto the window manager.
@@ -3717,9 +3722,12 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
 
     cell_size_mm: bpy.props.FloatProperty(
         update=_sna_voxel_stash_settings,
-        name='Block Size (mm)', default=5.0, min=0.5, max=100.0,
-        description='Size of each block/cube in millimeters. Smaller = finer blocks, more geometry',
-        precision=1, step=10,
+        name='Block Size (mm)', default=5.0, min=0.1, max=100.0,
+        description='Size of each block/cube in millimeters. Smaller = finer blocks, more geometry, '
+                    'and the cell count grows with the CUBE of the reduction — halving the block '
+                    'size is 8x the memory and time. Very small values need a small model or a '
+                    'cropped one; the operator stops with an error instead of running out of memory',
+        precision=2, step=1,
     )
     num_colors: bpy.props.IntProperty(
         update=_sna_voxel_stash_settings,
@@ -4100,7 +4108,15 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             grid_size_y += relief_n
         total_cells = grid_size_x * grid_size_y * grid_size_z
         log(f'Grid: {grid_size_x}×{grid_size_y}×{grid_size_z} = {total_cells} cells, bbox=[{bbox_min}] → [{bbox_max}]')
-
+        if total_cells > _SNA_VOXEL_MAX_CELLS:
+            # fail here, before a single array is allocated, with the block size that WOULD fit
+            fit_mm = self.cell_size_mm * (total_cells / _SNA_VOXEL_MAX_CELLS) ** (1.0 / 3.0)
+            longest = max(bbox_max - bbox_min) * 1000.0
+            raise RuntimeError(
+                f'Grid {grid_size_x}x{grid_size_y}x{grid_size_z} = {total_cells / 1e6:.0f}M cells at '
+                f'{self.cell_size_mm:g}mm blocks is over the {_SNA_VOXEL_MAX_CELLS / 1e6:.0f}M limit — '
+                f'the cell count grows with the cube of the reduction (this mesh is {longest:.0f}mm across). '
+                f'Use Block Size {fit_mm:.2f}mm or larger, or split/crop the mesh')
         yield (f'Grid: {grid_size_x}×{grid_size_y}×{grid_size_z} = {total_cells} cells', 3)
 
         # Phase 3: Voxel occupancy via face rasterization + vertex seeding + BVH verify.
