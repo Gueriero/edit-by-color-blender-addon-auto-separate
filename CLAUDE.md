@@ -77,7 +77,7 @@ Pipeline (фазы):
 10. Separate — атомарный `mesh.separate(MATERIAL)` или Progressive (per-cluster логи)
 11. Rename кусков по метрикам прогона (`_sna_palette_result_name` + `_sna_rename_split_results`): `PAL_K{k}_s{samples}_{hsv|rgb}[_mer][_ero{N}]_F{faces}_{src}_Split`, сортировка по cluster index (материал `EBC_Auto_NNN` первого полигона), лимит имени 63 байта — режется src
 
-Диалог помнит настройки на сессию (`_sna_palette_stash_settings`, ключ `sna_palette_last_settings`) — тот же паттерн что у вокселя. Тест: `sna.test_keep_original` (F3).
+Диалог помнит настройки на сессию (`_sna_palette_stash_settings` + `_SNA_PALETTE_PERSIST`) — тот же паттерн что у вокселя. **Stash лежит в модульном дикте `_SNA_DIALOG_STASH`, не в window manager**: WM-пропы стираются при каждом открытии .blend (проверено headless: set → `open_mainfile` → ключа нет), из-за чего настройки сбрасывались на каждой загрузке файла. Модульный стейт переживает загрузку .blend и переоткрытие диалога, но умирает с сессией Blender — как и задумано. Тесты: `sna.test_keep_original`, `sna.test_dialog_stash` (F3).
 
 ### Merge Small Islands — фильтры
 

@@ -136,8 +136,8 @@ cluster.
    empty if the requested K is higher than the actual color variety in
    the texture — those are skipped).
 5. All dialog settings are remembered for the session (same as the
-   Voxel Block Remesh dialog): cancelling and reopening keeps your
-   values, restarting Blender resets them.
+   Voxel Block Remesh dialog): cancelling, reopening, and opening other
+   `.blend` files keeps your values; restarting Blender resets them.
 
 ### Result names
 

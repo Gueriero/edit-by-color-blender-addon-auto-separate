@@ -2939,28 +2939,17 @@ _SNA_PALETTE_STASH_KEY = 'sna_palette_last_settings'
 def _sna_palette_stash_settings(op, context=None):
     if not getattr(op, '_dialog_open', False):
         return
-    try:
-        wm = (context if context is not None else bpy.context).window_manager
-    except Exception:
-        return
     store = {}
     for name in _SNA_PALETTE_PERSIST:
         try:
             store[name] = getattr(op, name)
         except Exception:
             pass
-    try:
-        wm[_SNA_PALETTE_STASH_KEY] = store
-    except Exception:
-        pass
+    _SNA_DIALOG_STASH[_SNA_PALETTE_STASH_KEY] = store
 
 
 def _sna_palette_restore_settings(op, context=None):
-    try:
-        wm = (context if context is not None else bpy.context).window_manager
-        store = wm.get(_SNA_PALETTE_STASH_KEY)
-    except Exception:
-        return
+    store = _SNA_DIALOG_STASH.get(_SNA_PALETTE_STASH_KEY)
     if not store:
         return
     for name in _SNA_PALETTE_PERSIST:
@@ -3837,11 +3826,15 @@ class SNA_OT_auto_palette_split(bpy.types.Operator):
         col.prop(self, 'kmeans_subsample')
 
 
-# Dialog settings of the voxel operator, remembered for the rest of the session. A props dialog
+# Dialog settings of the operators, remembered for the rest of the session. A props dialog
 # rebuilds its properties from the class defaults on every invoke, so anything typed is lost the
-# moment the user cancels to go fix the modifier. The window manager is not written into .blend
-# files (verified: props set there are gone after a restart), which gives exactly the wanted
-# lifetime — survive cancel-and-reopen, come back as defaults after Blender exits.
+# moment the user cancels to go fix the modifier.
+#
+# Kept in a module-level dict, NOT in the window manager: WM custom properties are wiped every
+# time a .blend is opened (verified headless — set property, open_mainfile, key gone), which
+# silently reset both dialogs on every file load. Module state survives file loads and dialog
+# re-opens, and still dies with the Blender session — exactly the wanted lifetime.
+_SNA_DIALOG_STASH = {}
 _SNA_VOXEL_PERSIST = (
     'cell_size_mm', 'num_colors', 'kmeans_iters', 'kmeans_subsample', 'use_hsv', 'do_separate',
     'remove_original', 'merge_verts', 'fill_open_edges', 'fix_checker', 'collapse_similar',
@@ -3857,7 +3850,7 @@ _SNA_VOXEL_MAX_CELLS = 200_000_000
 
 
 def _sna_voxel_stash_settings(op, context=None):
-    """Property update callback: mirror every edited value onto the window manager.
+    """Property update callback: mirror every edited value into the session stash.
 
     Only while the props dialog is open: the N-panel's button sets merge_verts / fill_open_edges
     / fix_checker on the operator template on every redraw, and letting those writes stash would
@@ -3865,29 +3858,18 @@ def _sna_voxel_stash_settings(op, context=None):
     """
     if not getattr(op, '_dialog_open', False):
         return
-    try:
-        wm = (context if context is not None else bpy.context).window_manager
-    except Exception:
-        return
     store = {}
     for name in _SNA_VOXEL_PERSIST:
         try:
             store[name] = getattr(op, name)
         except Exception:
             pass
-    try:
-        wm[_SNA_VOXEL_STASH_KEY] = store
-    except Exception:
-        pass
+    _SNA_DIALOG_STASH[_SNA_VOXEL_STASH_KEY] = store
 
 
 def _sna_voxel_restore_settings(op, context=None):
     """Put the remembered values back into a fresh operator instance before the dialog opens."""
-    try:
-        wm = (context if context is not None else bpy.context).window_manager
-        store = wm.get(_SNA_VOXEL_STASH_KEY)
-    except Exception:
-        return
+    store = _SNA_DIALOG_STASH.get(_SNA_VOXEL_STASH_KEY)
     if not store:
         return
     for name in _SNA_VOXEL_PERSIST:
@@ -5940,6 +5922,68 @@ class SNA_OT_test_keep_original(bpy.types.Operator):
                 except Exception: pass
 
 
+class SNA_OT_test_dialog_stash(bpy.types.Operator):
+    bl_idname = 'sna.test_dialog_stash'
+    bl_label = 'Self-Test: Dialog Settings Stash'
+    bl_description = ('Round-trips the remembered dialog settings of the voxel and palette operators: writes '
+                      'non-default values through the update callback, restores them into a fresh instance, and '
+                      'asserts the stash lives in the addon module rather than the window manager (WM custom '
+                      'properties are wiped on every file load). Reports PASS/FAIL in console')
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        class _Stub:
+            _dialog_open = True
+
+        def p(msg):
+            print(f'[TestStash] {msg}', flush=True)
+
+        def rna_of(cls):
+            ns, op_name = cls.bl_idname.split('.')
+            return getattr(getattr(bpy.ops, ns), op_name).get_rna_type()
+
+        p('=== test start ===')
+        ok = True
+        cases = (
+            ('voxel', SNA_OT_voxel_block_remesh, _SNA_VOXEL_PERSIST, _SNA_VOXEL_STASH_KEY,
+             _sna_voxel_stash_settings, _sna_voxel_restore_settings),
+            ('palette', SNA_OT_auto_palette_split, _SNA_PALETTE_PERSIST, _SNA_PALETTE_STASH_KEY,
+             _sna_palette_stash_settings, _sna_palette_restore_settings),
+        )
+        for label, cls, persist, key, stash_fn, restore_fn in cases:
+            props = rna_of(cls).properties
+            op = _Stub()
+            expect = {}
+            for name in persist:
+                default = props[name].default
+                if isinstance(default, bool):
+                    value = not default
+                elif isinstance(default, int):
+                    value = default + 1
+                else:
+                    value = float(default) + 0.37
+                setattr(op, name, value)
+                expect[name] = value
+            stash_fn(op, context)
+
+            fresh = _Stub()
+            for name in persist:                      # start from the class defaults
+                setattr(fresh, name, props[name].default)
+            restore_fn(fresh, context)
+            mismatched = [n for n in persist if getattr(fresh, n) != expect[n]]
+            in_wm = key in context.window_manager
+            p(f'{label}: {len(persist)} props, mismatched={mismatched}, still in WM={in_wm}')
+            ok = ok and not mismatched and not in_wm
+
+        if ok:
+            p('=== PASS ===')
+            self.report({'INFO'}, 'TestStash PASS')
+        else:
+            p('=== FAIL ===')
+            self.report({'ERROR'}, 'TestStash FAIL')
+        return {'FINISHED' if ok else 'CANCELLED'}
+
+
 class SNA_OT_remove_ebc_modifier_from_selected(bpy.types.Operator):
     bl_idname = 'sna.remove_ebc_modifier_from_selected'
     bl_label = 'Remove EBC Modifier from Selected'
@@ -6077,6 +6121,7 @@ def register():
     bpy.utils.register_class(SNA_OT_test_progressive_separate)
     bpy.utils.register_class(SNA_OT_test_merge_islands)
     bpy.utils.register_class(SNA_OT_test_keep_original)
+    bpy.utils.register_class(SNA_OT_test_dialog_stash)
     bpy.utils.register_class(SNA_OT_voxel_block_remesh)
     bpy.utils.register_class(SNA_OT_test_voxel_block_remesh)
     bpy.utils.register_class(SNA_OT_bake_materials_to_texture)
@@ -6156,6 +6201,7 @@ def unregister():
     del bpy.types.Scene.sna_palette_colors
     bpy.utils.unregister_class(SNA_OT_test_merge_islands)
     bpy.utils.unregister_class(SNA_OT_test_keep_original)
+    bpy.utils.unregister_class(SNA_OT_test_dialog_stash)
     bpy.utils.unregister_class(SNA_OT_bake_materials_to_texture)
     bpy.utils.unregister_class(SNA_OT_test_voxel_block_remesh)
     bpy.utils.unregister_class(SNA_OT_voxel_block_remesh)
