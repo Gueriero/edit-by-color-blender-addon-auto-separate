@@ -3895,6 +3895,11 @@ _SNA_VOXEL_STASH_KEY = 'sna_voxel_last_settings'
 # relief at 0.1mm would ask for 2.2 billion of them. Refuse before allocating anything.
 _SNA_VOXEL_MAX_CELLS = 200_000_000
 
+# Fast color sampling holds one uint32 per cell (packed RGB, 0 = not colored yet) plus
+# dilation views, i.e. ~4 bytes/cell on top of the occupancy grids. Past this cell count
+# that extra allocation stops being a good trade, so the operator keeps the BVH path.
+_SNA_VOXEL_FAST_MAX_CELLS = 120_000_000
+
 
 def _sna_voxel_stash_settings(op, context=None):
     """Property update callback: mirror every edited value into the session stash.
@@ -4194,6 +4199,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         col.prop(context.scene, 'sna_voxel_relief_back')
         col = layout.column(align=True)
         col.label(text='Advanced:')
+        col.prop(context.scene, 'sna_voxel_fast_color')
         col.prop(self, 'kmeans_iters')
         col.prop(self, 'kmeans_subsample')
 
@@ -4331,6 +4337,32 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                 f'{self.cell_size_mm:g}mm blocks is over the {_SNA_VOXEL_MAX_CELLS / 1e6:.0f}M limit — '
                 f'the cell count grows with the cube of the reduction (this mesh is {longest:.0f}mm across). '
                 f'Use Block Size {fit_mm:.2f}mm or larger, or split/crop the mesh')
+        # Fast color sampling: color every cell from the polygon that rasterized it, then
+        # spread that outward. Replaces one BVH nearest-neighbour query per emitted cube
+        # face — millions of them, ~100-300us each — with an array lookup.
+        cell_rgb = None
+        cell_rgb_flat = None
+        mat_pack = None
+        poly_mat_idx = None
+        uv_flat = None
+        if context.scene.sna_voxel_fast_color and total_cells <= _SNA_VOXEL_FAST_MAX_CELLS:
+            cell_rgb = np.zeros((grid_size_x, grid_size_y, grid_size_z), dtype=np.uint32)
+            cell_rgb_flat = cell_rgb.reshape(-1)  # same buffer; the rasterizer indexes 1D
+            if self.use_face_materials:
+                poly_mat_idx = np.empty(n_polys, dtype=np.int32)
+                mesh.polygons.foreach_get('material_index', poly_mat_idx)
+                mat_pack = np.zeros(max(1, len(mat_colors)), dtype=np.uint32)
+                for si, col in enumerate(mat_colors):
+                    mat_pack[si] = (0x01000000 | (int(col[0] * 255) << 16)
+                                    | (int(col[1] * 255) << 8) | int(col[2] * 255))
+            else:
+                uv_flat = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+                mesh.uv_layers[uv_name].data.foreach_get('uv', uv_flat)
+            log(f'Fast color sampling ON — extra {total_cells * 4 / 1e6:.0f} MB color grid')
+        elif context.scene.sna_voxel_fast_color:
+            log(f'Fast color sampling off: {total_cells / 1e6:.0f}M cells is over the '
+                f'{_SNA_VOXEL_FAST_MAX_CELLS / 1e6:.0f}M ceiling for the color grid, '
+                f'staying on the BVH path')
         yield (f'Grid: {grid_size_x}×{grid_size_y}×{grid_size_z} = {total_cells} cells', 3)
 
         # Phase 3: Voxel occupancy via face rasterization + vertex seeding + BVH verify.
@@ -4396,6 +4428,18 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
             # precomputed drop-coordinate for the third vertex (w = 1 - w0 - w1)
             drA, drB, drC = float(ia[drop]), float(ib[drop]), float(ic[drop])
 
+            cell_pack_val = None
+            if cell_rgb is not None:
+                if mat_pack is not None:
+                    cell_pack_val = int(mat_pack[int(poly_mat_idx[int(tri_poly[ti])])])
+                else:
+                    tl0 = int(tri_loops[ti * 3])
+                    tl1 = int(tri_loops[ti * 3 + 1])
+                    tl2 = int(tri_loops[ti * 3 + 2])
+                    ua = float(uv_flat[tl0 * 2]); va = float(uv_flat[tl0 * 2 + 1])
+                    ub = float(uv_flat[tl1 * 2]); vb = float(uv_flat[tl1 * 2 + 1])
+                    uc = float(uv_flat[tl2 * 2]); vc = float(uv_flat[tl2 * 2 + 1])
+
             ic_mid, ic_inner = ic[mid], ic[inner]
 
             for i_outer in range(int(mn[outer]), int(mx[outer]) + 1):
@@ -4417,6 +4461,26 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                                 iz = i_inner if inner == 2 else (i_outer if outer == 2 else i_mid)
                                 _add(ix, iy, iz)
                                 rast_total += 1
+                                if cell_rgb_flat is not None:
+                                    cell_lin = (ix * grid_size_y + iy) * grid_size_z + iz
+                                    if cell_pack_val is not None:
+                                        cell_rgb_flat[cell_lin] = cell_pack_val
+                                    else:
+                                        # UV of this cell centre on the triangle, then the texel
+                                        uu = ua * w0 + ub * w1 + uc * w2
+                                        vv = va * w0 + vb * w1 + vc * w2
+                                        uu -= math.floor(uu)
+                                        vv -= math.floor(vv)
+                                        tx_i = int(uu * w_img)
+                                        ty_i = int(vv * h_img)
+                                        if tx_i >= w_img:
+                                            tx_i = w_img - 1
+                                        if ty_i >= h_img:
+                                            ty_i = h_img - 1
+                                        cpx = img[ty_i, tx_i]
+                                        cell_rgb_flat[cell_lin] = (
+                                            0x01000000 | (int(cpx[0] * 255) << 16)
+                                            | (int(cpx[1] * 255) << 8) | int(cpx[2] * 255))
                         w0 += step0
                         w1 += step1
             if len(occupied) % 50000 == 0:
@@ -4601,6 +4665,7 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
         t_faces = time.time()
         # For each face, we store: (ix, iy, iz, dir_idx)
         faces_to_emit = []
+        dir_spans = []
         for di, (dx, dy, dz) in enumerate(DIRS):
             # occupancy of the neighbour in direction di; cells outside the grid count as empty
             nbr = np.zeros_like(occ)
@@ -4611,18 +4676,79 @@ class SNA_OT_voxel_block_remesh(bpy.types.Operator):
                 max(-dy, 0):gy + min(-dy, 0),
                 max(-dz, 0):gz + min(-dz, 0)] = src
             cells = np.argwhere(occ & ~nbr)
+            span_start = len(faces_to_emit)
             faces_to_emit.extend((int(x), int(y), int(z), di) for x, y, z in cells)
+            dir_spans.append((span_start, len(faces_to_emit),
+                              cells if cell_rgb is not None else None))
         log(f'Surface faces: {len(faces_to_emit)} (culled from {n_occupied * 6} potential) in {time.time() - t_faces:.1f}s')
         yield (f'{len(faces_to_emit)} surface faces', 25)
+
+        # face_colors lives here rather than in the color phase below: the fast path fills
+        # it straight from the cell grid, and the BVH loop only mops up what it missed.
+        face_colors = np.zeros((len(faces_to_emit), 3), dtype=np.float32)
+
+        # Fast path: spread the rasterized cell colors over the shell that the 1-ring
+        # expand / flood fill / relief columns added, then hand every face its cell color
+        # in one vectorised pass. Only the cells the spread could not reach (deep relief
+        # slabs) fall through to the BVH loop below.
+        fast_left = None
+        if cell_rgb is not None:
+            yield ('Spreading cell colors...', 26)
+            t_spread = time.time()
+            # Only cells that actually emit a face need a color. Without this the spread
+            # floods the whole interior volume (millions of cells that never show up) —
+            # with it the work stops as soon as the surface shell is covered.
+            need = np.zeros(cell_rgb.shape, dtype=bool)
+            for _, _, span_cells in dir_spans:
+                if span_cells is not None:
+                    need[span_cells[:, 0], span_cells[:, 1], span_cells[:, 2]] = True
+            spread_iters = 0
+            for _ in range(32):
+                if not np.any(need & (cell_rgb == 0)):
+                    break
+                for (dx, dy, dz) in DIRS:
+                    src_c = cell_rgb[max(dx, 0):gx + min(dx, 0),
+                                     max(dy, 0):gy + min(dy, 0),
+                                     max(dz, 0):gz + min(dz, 0)]
+                    dst_c = cell_rgb[max(-dx, 0):gx + min(-dx, 0),
+                                     max(-dy, 0):gy + min(-dy, 0),
+                                     max(-dz, 0):gz + min(-dz, 0)]
+                    np.copyto(dst_c, src_c, where=(dst_c == 0) & (src_c != 0))
+                spread_iters += 1
+                if not np.any(need & (cell_rgb == 0)):
+                    break
+            flat_rgb = cell_rgb.reshape(-1)
+            fast_left = np.ones(len(faces_to_emit), dtype=bool)
+            filled = 0
+            for span_start, span_end, cells in dir_spans:
+                if cells is None or span_end <= span_start:
+                    continue
+                lin = (cells[:, 0] * gy + cells[:, 1]) * gz + cells[:, 2]
+                packed = flat_rgb[lin]
+                ok = packed != 0
+                if not ok.any():
+                    continue
+                fast_left[span_start:span_end][ok] = False
+                face_colors[span_start:span_end][ok] = np.stack(
+                    ((packed[ok] >> 16) & 255, (packed[ok] >> 8) & 255, packed[ok] & 255),
+                    axis=1).astype(np.float32) / 255.0
+                filled += int(ok.sum())
+            del dir_spans
+            log(f'Fast color pass: {filled}/{len(faces_to_emit)} faces from cells in '
+                f'{time.time() - t_spread:.1f}s, {spread_iters} spread iteration(s), '
+                f'{int(fast_left.sum())} left for BVH')
+            yield (f'Fast colors: {filled} faces from cells', 27)
 
         # Phase 5: Color sampling per face via BVHTree -> UV -> texture
         yield ('Sampling texture color per face...', 27)
         t_color = time.time()
         uv_layer = None if self.use_face_materials else mesh.uv_layers[uv_name].data
-        face_colors = np.zeros((len(faces_to_emit), 3), dtype=np.float32)
         M_inv = np.array(obj.matrix_world.inverted(), dtype=np.float32)
 
-        for fi, (ix, iy, iz, di) in enumerate(faces_to_emit):
+        for fi, (ix, iy, iz, di) in enumerate(
+                faces_to_emit if (fast_left is None or fast_left.any()) else ()):
+            if fast_left is not None and fast_left[fi]:
+                continue
             # Voxel center
             vx = bbox_min[0] + (ix + 0.5) * cell_size
             vy = bbox_min[1] + (iy + 0.5) * cell_size
@@ -6131,6 +6257,7 @@ def sna_voxel_block_remesh_interface(layout_function):
     col.prop(bpy.context.scene, 'sna_voxel_wall_cells')
     col.prop(bpy.context.scene, 'sna_voxel_relief_thickness_mm')
     col.prop(bpy.context.scene, 'sna_voxel_relief_back')
+    col.prop(bpy.context.scene, 'sna_voxel_fast_color')
     op = box.operator('sna.voxel_block_remesh', text='Voxel Remesh & Colorize',
                       icon_value=string_to_icon('MOD_BUILD'))
     op.merge_verts = True
@@ -6262,6 +6389,13 @@ def register():
                ('Y_POS', '+Y (back)', 'Thickness grows toward +Y', 0, 1),
                ('AUTO', 'Auto', 'Pick the side opposite the average face normal', 0, 2)],
         description='Direction the relief thickness grows from the surface')
+    bpy.types.Scene.sna_voxel_fast_color = bpy.props.BoolProperty(
+        name='Fast Color Sampling', default=False,
+        description='Color each voxel from the source polygon that covers it instead of '
+                    'ray-casting the mesh per cube face. Skips millions of BVH queries — '
+                    'the color pass drops from minutes to seconds. Same colors when the '
+                    'polygons are smaller than the voxels (the usual case); one flat color '
+                    'per cube, no per-face speckle')
     if _gcode_import:
         _gcode_import.register()
 
@@ -6311,6 +6445,7 @@ def unregister():
     del bpy.types.Scene.sna_voxel_wall_cells
     del bpy.types.Scene.sna_voxel_cap_side
     del bpy.types.Scene.sna_voxel_relief_back
+    del bpy.types.Scene.sna_voxel_fast_color
     del bpy.types.Scene.sna_voxel_relief_thickness_mm
     del bpy.types.Scene.sna_palette_active_index
     del bpy.types.Scene.sna_palette_colors
