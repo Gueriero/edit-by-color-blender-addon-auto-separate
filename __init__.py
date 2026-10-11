@@ -1247,6 +1247,9 @@ class SNA_PT_EDIT_BY_COLOUR_BY_KIRI_ENGINE_955BF(bpy.types.Panel):
         layout.separator(factor=1.0)
         sna_voxel_block_remesh_interface(layout)
         layout.separator(factor=1.0)
+        if _gcode_import:
+            _gcode_import.sna_gcode_import_interface(layout)
+            layout.separator(factor=1.0)
         sna_bake_materials_interface(layout)
 
 
@@ -6173,6 +6176,16 @@ def sna_bake_materials_interface(layout_function):
                  icon_value=string_to_icon('RENDER_STILL'))
 
 
+# Imported at the bottom, not at the top: gcode_import pulls _SNA_DIALOG_STASH and
+# _sna_stash_update out of this package, and those only exist once the module body above
+# has finished running. Guarded so the addon still loads if the module is missing.
+try:
+    from . import gcode_import as _gcode_import
+except Exception as _gcode_err:  # not loaded as a package, or the file is missing
+    _gcode_import = None
+    print(f'[EBC] gcode_import unavailable: {_gcode_err}', flush=True)
+
+
 def register():
     global _icons
     _SNA_DIALOG_STASH.update(_sna_settings_load())
@@ -6249,10 +6262,14 @@ def register():
                ('Y_POS', '+Y (back)', 'Thickness grows toward +Y', 0, 1),
                ('AUTO', 'Auto', 'Pick the side opposite the average face normal', 0, 2)],
         description='Direction the relief thickness grows from the surface')
+    if _gcode_import:
+        _gcode_import.register()
 
 
 def unregister():
     global _icons
+    if _gcode_import:
+        _gcode_import.unregister()
     bpy.utils.previews.remove(_icons)
     wm = bpy.context.window_manager
     kc = wm.keyconfigs.addon
